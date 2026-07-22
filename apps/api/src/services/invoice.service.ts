@@ -1,4 +1,4 @@
-import mongoose from 'mongoose';
+import mongoose, { type ClientSession } from 'mongoose';
 import {
   CompanyProfile,
   Invoice,
@@ -10,6 +10,9 @@ import {
 } from '../models/index.js';
 import { toDecimalString, toNumber } from '../utils/decimal.js';
 import { findSystemCategory, resolveBankAccount } from '../utils/txnCreate.js';
+import { financialYear, istMonth } from '../utils/dateIst.js';
+import { withTxn } from '../utils/withTxn.js';
+import { AppError } from '../middleware/error.middleware.js';
 
 /** Basic Indian GSTIN format: 15 chars, state code + PAN + entity + Z + check. */
 const GSTIN_REGEX = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/;
@@ -41,14 +44,16 @@ export interface InvoiceMoneyBreakdown {
  * Returns the singleton company profile, creating a default if missing.
  */
 export async function getOrCreateCompanyProfile() {
-  const existing = await CompanyProfile.findOne().lean();
-  if (existing) return existing;
-  const created = await CompanyProfile.create({
-    firmName: 'ApexLedger Firm',
-    invoicePrefix: 'AL-',
-    nextInvoiceNumber: 1,
-  });
-  return created.toObject();
+  // Upsert on the immutable singletonKey so concurrent callers can't create
+  // two profiles (the unique index would reject the second).
+  await CompanyProfile.updateOne(
+    { singletonKey: 'company' },
+    { $setOnInsert: { firmName: 'ApexLedger Firm', invoicePrefix: 'AL' } },
+    { upsert: true }
+  );
+  const profile = await CompanyProfile.findOne({ singletonKey: 'company' }).lean();
+  if (!profile) throw new AppError('Company profile could not be loaded', 500);
+  return profile;
 }
 
 /**
@@ -140,25 +145,56 @@ export function computeInvoiceMoney(
 }
 
 /**
- * Atomically allocates the next invoice number (PREFIX + padded seq).
+ * Atomically allocates the next invoice number for the financial year of
+ * `issueDate`, formatted PREFIX/FY/SEQ (e.g. AL/2025-26/0042). The counter is
+ * incremented inside the caller's transaction, so an aborted issue rolls the
+ * number back — no burned/gapped numbers.
+ * @param issueDate - Instant the invoice is issued (drives the FY, in IST)
+ * @param session - Open transaction session
  */
-export async function allocateInvoiceNumber(): Promise<{
-  number: string;
-  snapshot: ICompanySnapshot;
-}> {
-  await getOrCreateCompanyProfile();
+export async function allocateInvoiceNumber(
+  issueDate: Date,
+  session: ClientSession
+): Promise<{ number: string; snapshot: ICompanySnapshot }> {
+  const fy = financialYear(issueDate);
   const current = await CompanyProfile.findOneAndUpdate(
-    {},
-    { $inc: { nextInvoiceNumber: 1 } },
-    { new: false }
+    { singletonKey: 'company' },
+    { $inc: { [`invoiceCounters.${fy}`]: 1 } },
+    { new: true, session }
   );
   if (!current) {
-    throw new Error('Company profile not configured');
+    throw new AppError('Company profile not configured', 400);
   }
-  const seq = current.nextInvoiceNumber ?? 1;
-  const prefix = current.invoicePrefix || 'AL-';
-  const number = `${prefix}${String(seq).padStart(4, '0')}`;
+  const seq = current.invoiceCounters?.get(fy) ?? 1;
+  const prefix = (current.invoicePrefix || 'AL').replace(/\/+$/, '');
+  const number = `${prefix}/${fy}/${String(seq).padStart(4, '0')}`;
   return { number, snapshot: buildCompanySnapshot(current) };
+}
+
+/**
+ * Issues a draft invoice: allocates its FY number, stamps the company snapshot,
+ * and flips status — atomically, so a failure leaves the draft untouched.
+ * @param invoiceId - Draft invoice id
+ * @param ventureId - Owning venture id
+ */
+export async function issueInvoice(invoiceId: string, ventureId: string): Promise<IInvoice> {
+  const ready = await assertCompanyReadyToIssue();
+  if (!ready.ok) throw new AppError(ready.error, 400);
+
+  return withTxn(async (session) => {
+    const invoice = await Invoice.findOne({ _id: invoiceId, ventureId }).session(session);
+    if (!invoice) throw new AppError('Invoice not found', 404);
+    if (invoice.status !== 'draft') throw new AppError('Only drafts can be issued', 400);
+
+    const issueDate = new Date();
+    const { number, snapshot } = await allocateInvoiceNumber(issueDate, session);
+    invoice.number = number;
+    invoice.companySnapshot = snapshot;
+    invoice.status = 'issued';
+    invoice.issueDate = issueDate;
+    await invoice.save({ session });
+    return invoice;
+  });
 }
 
 /**
@@ -209,52 +245,62 @@ export async function markInvoicePaid(params: {
     params;
 
   if (invoice.status !== 'issued') {
-    throw new Error('Only issued invoices can be marked paid');
+    throw new AppError('Only issued invoices can be marked paid', 400);
   }
   if (!attachmentIds.length) {
-    throw new Error('Proof attachment is required');
+    throw new AppError('Proof attachment is required', 400);
   }
 
   const venture = await Venture.findById(ventureId);
   if (!venture || venture.status === 'closed') {
-    throw new Error('Project is closed or not found');
+    throw new AppError('Project is closed or not found', 400);
   }
 
   const bank = resolveBankAccount(venture, bankAccountId);
   if (!bank) {
-    throw new Error('Invalid or inactive project bank account');
+    throw new AppError('Invalid or inactive project bank account', 400);
   }
 
   const earningCat = await findSystemCategory('EARNING');
   const amount = toNumber(invoice.totalAmount);
 
-  const txn = await Transaction.create({
-    ventureId,
-    type: 'EARNING_IN',
-    partnerId,
-    amount: mongoose.Types.Decimal128.fromString(toDecimalString(amount)),
-    date,
-    paidFrom: paidFrom.trim(),
-    remark: remark.trim() || `Invoice ${invoice.number} payment`,
-    bankAccountId: bank.bankAccountId,
-    bankAccountLabel: bank.bankAccountLabel,
-    categoryId: earningCat?._id,
-    categoryName: earningCat?.name,
-    createdById: partnerId,
+  // Atomic: create the earning, link proof, and flip the invoice together.
+  const transactionId = await withTxn(async (session) => {
+    const [txn] = await Transaction.create(
+      [
+        {
+          ventureId,
+          type: 'EARNING_IN',
+          partnerId,
+          amount: mongoose.Types.Decimal128.fromString(toDecimalString(amount)),
+          date,
+          paidFrom: paidFrom.trim(),
+          remark: remark.trim() || `Invoice ${invoice.number} payment`,
+          bankAccountId: bank.bankAccountId,
+          bankAccountLabel: bank.bankAccountLabel,
+          categoryId: earningCat?._id,
+          categoryName: earningCat?.name,
+          createdById: partnerId,
+        },
+      ],
+      { session }
+    );
+
+    await Attachment.updateMany(
+      { _id: { $in: attachmentIds }, ventureId },
+      { transactionId: txn._id },
+      { session }
+    );
+
+    invoice.status = 'paid';
+    invoice.linkedEarningTransactionId = txn._id;
+    invoice.linkedBankAccountId = bank.bankAccountId;
+    invoice.linkedBankAccountLabel = bank.bankAccountLabel;
+    await invoice.save({ session });
+    return String(txn._id);
   });
 
-  await Attachment.updateMany(
-    { _id: { $in: attachmentIds }, ventureId },
-    { transactionId: txn._id }
-  );
-
-  invoice.status = 'paid';
-  invoice.linkedEarningTransactionId = txn._id;
-  invoice.linkedBankAccountId = bank.bankAccountId;
-  invoice.linkedBankAccountLabel = bank.bankAccountLabel;
-  await invoice.save();
-
-  return { invoice, transactionId: String(txn._id) };
+  return { invoice, transactionId };
 }
 
 export interface GstMonthRow {
@@ -307,7 +353,7 @@ export async function computeGstSummary(
 
   for (const inv of invoices) {
     const d = inv.issueDate ? new Date(inv.issueDate) : new Date(inv.createdAt);
-    const period = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+    const period = istMonth(d);
     const row = monthMap.get(period) ?? {
       period,
       invoiceCount: 0,

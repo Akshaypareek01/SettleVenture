@@ -1,7 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
 import { PutObjectCommand, DeleteObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { PutObjectCommand as PutCmd } from '@aws-sdk/client-s3';
 import {
   assertFileStorageReady,
   env,
@@ -113,15 +112,21 @@ export async function presignUpload(
 
 /**
  * Resolves the URL clients should use to view/download a file.
- * Prefers stored publicUrl; falls back to building from r2Key.
+ * Rebuilds from R2_PUBLIC_BASE_URL when stored URL is missing or is the S3 API host.
  * @param r2Key - Object key
  * @param storedPublicUrl - URL saved on attachment at upload time
  */
 export function resolveFileUrl(r2Key: string, storedPublicUrl?: string | null): string {
-  if (storedPublicUrl?.trim()) return storedPublicUrl.trim();
+  const stored = storedPublicUrl?.trim() ?? '';
+  const storedIsUsable =
+    stored.length > 0 && !stored.toLowerCase().includes('.r2.cloudflarestorage.com');
+  if (storedIsUsable) return stored;
+
   const built = getPublicFileUrl(r2Key);
   if (built) return built;
-  throw new Error('File URL unavailable — configure R2_PUBLIC_BASE_URL');
+  throw new Error(
+    'File URL unavailable — set R2_PUBLIC_BASE_URL to https://pub-….r2.dev (not the S3 API endpoint)'
+  );
 }
 
 /**
@@ -155,9 +160,15 @@ export async function deleteFile(r2Key: string): Promise<void> {
 export function logStorageConfig(): void {
   if (isR2Configured() && isPublicUrlConfigured()) {
     console.info('[storage] Cloudflare R2 — public URLs via', env.R2_PUBLIC_BASE_URL);
-  } else {
-    console.warn(
-      '[storage] R2 not fully configured — uploads will fail until R2_* and R2_PUBLIC_BASE_URL are set'
-    );
+    return;
   }
+  if (env.R2_PUBLIC_BASE_URL.includes('r2.cloudflarestorage.com')) {
+    console.warn(
+      '[storage] R2_PUBLIC_BASE_URL is the S3 API endpoint — proofs will not open. Use https://pub-….r2.dev from Cloudflare R2 → bucket → Public access'
+    );
+    return;
+  }
+  console.warn(
+    '[storage] R2 not fully configured — uploads will fail until R2_* and R2_PUBLIC_BASE_URL (pub-….r2.dev) are set'
+  );
 }

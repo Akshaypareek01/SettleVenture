@@ -27,10 +27,16 @@ router.use('/ventures', adminVenturesRoutes);
 router.use('/assignments', adminAssignmentsRoutes);
 router.use('/company-profile', adminCompanyRoutes);
 
+const passwordSchema = z
+  .string()
+  .min(8, 'Password must be at least 8 characters')
+  .regex(/[a-zA-Z]/, 'Password must contain a letter')
+  .regex(/[0-9]/, 'Password must contain a number');
+
 const createPartnerSchema = z.object({
   name: z.string().min(2),
   email: z.string().email(),
-  password: z.string().min(6),
+  password: passwordSchema,
   role: z.enum(['partner', 'admin']).default('partner'),
 });
 
@@ -117,12 +123,22 @@ router.patch('/partners/:id', async (req: AuthRequest, res: Response): Promise<v
     const updateSchema = z.object({
       name: z.string().min(2).optional(),
       isActive: z.boolean().optional(),
-      password: z.string().min(6).optional(),
+      password: passwordSchema.optional(),
     });
     const data = updateSchema.parse(req.body);
 
     if (String(req.params.id) === String(req.user!._id) && data.isActive === false) {
       res.status(400).json({ error: 'You cannot deactivate your own account' });
+      return;
+    }
+
+    const target = await Partner.findById(req.params.id).select('role').lean();
+    if (!target) {
+      res.status(404).json({ error: 'Partner not found' });
+      return;
+    }
+    if (target.role === 'admin' && String(req.params.id) !== String(req.user!._id)) {
+      res.status(403).json({ error: 'Admin accounts can only be modified by their owner' });
       return;
     }
 

@@ -325,8 +325,8 @@ function ResetPasswordModal({ partner, onClose, onSaved }: ResetPasswordModalPro
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    if (password.length < 6) {
-      setError('Password must be at least 6 characters');
+    if (password.length < 8 || !/[A-Za-z]/.test(password) || !/\d/.test(password)) {
+      setError('Password must be at least 8 characters with a letter and a number');
       return;
     }
     setSaving(true);
@@ -371,9 +371,11 @@ function ResetPasswordModal({ partner, onClose, onSaved }: ResetPasswordModalPro
             className="input-field"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            placeholder="Min 6 characters"
+            placeholder="8+ chars, letter + number"
             required
-            minLength={6}
+            minLength={8}
+            pattern="(?=.*[A-Za-z])(?=.*\d).{8,}"
+            title="At least 8 characters with a letter and a number"
             aria-label="New password"
           />
           <div className="flex gap-2 pt-2">

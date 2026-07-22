@@ -35,6 +35,9 @@ const GLOBAL_CATEGORIES: { name: string; direction: 'IN' | 'OUT'; systemKey?: st
  * Seeds the database with demo data for development.
  */
 async function seed(): Promise<void> {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('Refusing to seed: this wipes collections and NODE_ENV is production');
+  }
   await connectDb();
 
   await Promise.all([

@@ -50,16 +50,61 @@ export interface VentureSummary {
  * @param ventureId - Venture ObjectId string
  */
 export async function computeVentureSummary(ventureId: string): Promise<VentureSummary> {
-  const [txns, assignments, venture, emiSummary] = await Promise.all([
-    Transaction.find({ ventureId, isDeleted: false }).lean(),
+  const vid = new Types.ObjectId(ventureId);
+  const [partnerAgg, bankAgg, assignments, venture, emiSummary] = await Promise.all([
+    // Per-partner sums, computed in MongoDB on Decimal128 (no float drift, no full load).
+    Transaction.aggregate<{
+      _id: Types.ObjectId;
+      depositedToPool: Types.Decimal128;
+      directExpenses: Types.Decimal128;
+      earningsTotal: Types.Decimal128;
+    }>([
+      { $match: { ventureId: vid, isDeleted: false } },
+      {
+        $group: {
+          _id: '$partnerId',
+          depositedToPool: {
+            $sum: { $cond: [{ $eq: ['$type', 'CONTRIBUTION_IN'] }, '$amount', 0] },
+          },
+          directExpenses: {
+            $sum: { $cond: [{ $eq: ['$type', 'EXPENSE'] }, '$amount', 0] },
+          },
+          earningsTotal: {
+            $sum: { $cond: [{ $eq: ['$type', 'EARNING_IN'] }, '$amount', 0] },
+          },
+        },
+      },
+    ]),
+    // Per-bank in/out sums.
+    Transaction.aggregate<{
+      _id: Types.ObjectId;
+      label: string;
+      totalIn: Types.Decimal128;
+      totalOut: Types.Decimal128;
+    }>([
+      { $match: { ventureId: vid, isDeleted: false, bankAccountId: { $ne: null } } },
+      {
+        $group: {
+          _id: '$bankAccountId',
+          label: { $last: '$bankAccountLabel' },
+          totalIn: {
+            $sum: {
+              $cond: [{ $in: ['$type', ['CONTRIBUTION_IN', 'EARNING_IN']] }, '$amount', 0],
+            },
+          },
+          totalOut: {
+            $sum: {
+              $cond: [{ $in: ['$type', ['VENDOR_PAYMENT_OUT', 'EMI_FROM_BANK']] }, '$amount', 0],
+            },
+          },
+        },
+      },
+    ]),
     PartnerVenture.find({ ventureId }).populate('partnerId', 'name').lean(),
     Venture.findById(ventureId).lean(),
     computeVentureEmiSummary(ventureId),
   ]);
 
-  let poolInTotal = 0;
-  let poolOutTotal = 0;
-  let earningsTotal = 0;
   const assignedIds = new Set(
     assignments.map((a) => {
       const p = a.partnerId as unknown as { _id: Types.ObjectId };
@@ -88,59 +133,55 @@ export async function computeVentureSummary(ventureId: string): Promise<VentureS
     });
   }
 
-  const bankMap = new Map<string, { label: string; totalIn: number; totalOut: number }>();
-  for (const acct of venture?.bankAccounts ?? []) {
-    bankMap.set(String(acct._id), {
-      label: acct.label,
-      totalIn: 0,
-      totalOut: 0,
-    });
-  }
-
-  for (const txn of txns) {
-    const amt = toNumber(txn.amount);
-    const pid = String(txn.partnerId);
-    if (!partnerMap.has(pid)) {
-      const partner = await Partner.findById(pid).lean();
-      partnerMap.set(pid, {
-        name: partner?.name ?? 'Unknown',
+  // Names for partners with history but no current assignment — one batched query.
+  const unknownIds = partnerAgg
+    .map((r) => String(r._id))
+    .filter((id) => !partnerMap.has(id));
+  if (unknownIds.length) {
+    const formerPartners = await Partner.find({ _id: { $in: unknownIds } })
+      .select('name')
+      .lean();
+    const nameById = new Map(formerPartners.map((p) => [String(p._id), p.name]));
+    for (const id of unknownIds) {
+      partnerMap.set(id, {
+        name: nameById.get(id) ?? 'Unknown',
         depositedToPool: 0,
         directExpenses: 0,
         earningsTotal: 0,
-        isAssigned: assignedIds.has(pid),
+        isAssigned: assignedIds.has(id),
       });
     }
-    const entry = partnerMap.get(pid)!;
+  }
 
-    if (txn.type === 'CONTRIBUTION_IN') {
-      poolInTotal += amt;
-      entry.depositedToPool += amt;
-    } else if (txn.type === 'VENDOR_PAYMENT_OUT' || txn.type === 'EMI_FROM_BANK') {
-      poolOutTotal += amt;
-    } else if (txn.type === 'EXPENSE') {
-      entry.directExpenses += amt;
-    } else if (txn.type === 'EARNING_IN') {
-      earningsTotal += amt;
-      entry.earningsTotal += amt;
-    }
-    // EMI_PERSONAL: tracked in emiSummary only — not fair share, not pool, not bank
+  let poolInTotal = 0;
+  let poolOutTotal = 0;
+  let earningsTotal = 0;
 
-    if (txn.bankAccountId) {
-      const aid = String(txn.bankAccountId);
-      if (!bankMap.has(aid)) {
-        bankMap.set(aid, {
-          label: txn.bankAccountLabel ?? 'Unknown account',
-          totalIn: 0,
-          totalOut: 0,
-        });
-      }
-      const bank = bankMap.get(aid)!;
-      if (txn.type === 'CONTRIBUTION_IN' || txn.type === 'EARNING_IN') {
-        bank.totalIn += amt;
-      } else if (txn.type === 'VENDOR_PAYMENT_OUT' || txn.type === 'EMI_FROM_BANK') {
-        bank.totalOut += amt;
-      }
-    }
+  for (const row of partnerAgg) {
+    const entry = partnerMap.get(String(row._id));
+    if (!entry) continue;
+    entry.depositedToPool = toNumber(row.depositedToPool);
+    entry.directExpenses = toNumber(row.directExpenses);
+    entry.earningsTotal = toNumber(row.earningsTotal);
+    poolInTotal += entry.depositedToPool;
+    earningsTotal += entry.earningsTotal;
+  }
+
+  const bankMap = new Map<string, { label: string; totalIn: number; totalOut: number }>();
+  for (const acct of venture?.bankAccounts ?? []) {
+    bankMap.set(String(acct._id), { label: acct.label, totalIn: 0, totalOut: 0 });
+  }
+  for (const row of bankAgg) {
+    const aid = String(row._id);
+    const existing = bankMap.get(aid);
+    const totalIn = toNumber(row.totalIn);
+    const totalOut = toNumber(row.totalOut);
+    poolOutTotal += totalOut;
+    bankMap.set(aid, {
+      label: existing?.label ?? row.label ?? 'Unknown account',
+      totalIn,
+      totalOut,
+    });
   }
 
   const byPartner: PartnerSummary[] = [];

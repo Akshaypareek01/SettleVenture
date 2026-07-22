@@ -16,6 +16,10 @@ export interface ICompanyProfile extends Document {
   ifsc?: string;
   invoicePrefix: string;
   nextInvoiceNumber: number;
+  /** Per-financial-year invoice sequence, e.g. { "2025-26": 42 }. */
+  invoiceCounters: Map<string, number>;
+  /** Enforces a single company profile document. */
+  singletonKey: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -34,8 +38,10 @@ const companyProfileSchema = new Schema<ICompanyProfile>(
     bankName: { type: String, trim: true },
     bankAccountHint: { type: String, trim: true },
     ifsc: { type: String, trim: true },
-    invoicePrefix: { type: String, required: true, trim: true, default: 'AL-' },
+    invoicePrefix: { type: String, required: true, trim: true, default: 'AL' },
     nextInvoiceNumber: { type: Number, required: true, default: 1, min: 1 },
+    invoiceCounters: { type: Map, of: Number, default: {} },
+    singletonKey: { type: String, default: 'company', unique: true, immutable: true },
   },
   { timestamps: true }
 );

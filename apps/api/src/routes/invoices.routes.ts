@@ -5,13 +5,13 @@ import { Invoice, Venture } from '../models/index.js';
 import { AuthRequest, requireAuth, requireVentureAccess } from '../middleware/auth.middleware.js';
 import { parsePagination, paginatedResult, searchRegex } from '../utils/pagination.js';
 import {
-  allocateInvoiceNumber,
-  assertCompanyReadyToIssue,
   computeInvoiceMoney,
   getOrCreateCompanyProfile,
+  issueInvoice,
   markInvoicePaid,
   serializeInvoice,
 } from '../services/invoice.service.js';
+import { AppError } from '../middleware/error.middleware.js';
 
 const router = Router({ mergeParams: true });
 router.use(requireAuth);
@@ -171,22 +171,8 @@ router.patch(
       const action = typeof req.body.action === 'string' ? req.body.action : '';
 
       if (action === 'issue') {
-        if (invoice.status !== 'draft') {
-          res.status(400).json({ error: 'Only drafts can be issued' });
-          return;
-        }
-        const ready = await assertCompanyReadyToIssue();
-        if (!ready.ok) {
-          res.status(400).json({ error: ready.error });
-          return;
-        }
-        const { number, snapshot } = await allocateInvoiceNumber();
-        invoice.number = number;
-        invoice.companySnapshot = snapshot;
-        invoice.status = 'issued';
-        invoice.issueDate = new Date();
-        await invoice.save();
-        res.json(serializeInvoice(invoice.toObject() as unknown as Record<string, unknown>));
+        const issued = await issueInvoice(String(invoice._id), ventureId);
+        res.json(serializeInvoice(issued.toObject() as unknown as Record<string, unknown>));
         return;
       }
 
@@ -221,6 +207,10 @@ router.patch(
     } catch (err) {
       if (err instanceof z.ZodError) {
         res.status(400).json({ error: err.errors[0]?.message });
+        return;
+      }
+      if (err instanceof AppError) {
+        res.status(err.status).json({ error: err.message });
         return;
       }
       res.status(500).json({ error: 'Failed to update invoice' });
@@ -264,8 +254,8 @@ router.post(
         res.status(400).json({ error: err.errors[0]?.message });
         return;
       }
-      if (err instanceof Error) {
-        res.status(400).json({ error: err.message });
+      if (err instanceof AppError) {
+        res.status(err.status).json({ error: err.message });
         return;
       }
       res.status(500).json({ error: 'Failed to mark invoice paid' });

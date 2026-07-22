@@ -29,7 +29,7 @@ interface CompanyProfileFormProps {
 export default function CompanyProfileForm({ onSaved }: CompanyProfileFormProps) {
   const [form, setForm] = useState<CompanyProfile>({
     firmName: '',
-    invoicePrefix: 'AL-',
+    invoicePrefix: 'AL',
     nextInvoiceNumber: 1,
   });
   const [loading, setLoading] = useState(true);
@@ -67,12 +67,13 @@ export default function CompanyProfileForm({ onSaved }: CompanyProfileFormProps)
     setSaving(true);
     setError('');
     try {
+      const prefix = form.invoicePrefix.trim().replace(/[-/]+$/, '') || 'AL';
       const saved = await api<CompanyProfile>('/admin/company-profile', {
         method: 'PUT',
         body: JSON.stringify({
           ...form,
+          invoicePrefix: prefix,
           email: form.email || undefined,
-          nextInvoiceNumber: Number(form.nextInvoiceNumber) || 1,
         }),
       });
       setForm(saved);
@@ -193,25 +194,23 @@ export default function CompanyProfileForm({ onSaved }: CompanyProfileFormProps)
           />
         </div>
       </div>
-      <div className="grid sm:grid-cols-2 gap-3">
+      <div>
+        <label htmlFor="invoicePrefix" className="block text-sm font-medium mb-2">
+          Invoice prefix
+        </label>
         <input
+          id="invoicePrefix"
           className="input-field"
-          placeholder="Invoice prefix"
+          placeholder="AL"
           value={form.invoicePrefix}
           onChange={(e) => setField('invoicePrefix', e.target.value)}
           required
           aria-label="Invoice prefix"
         />
-        <input
-          className="input-field"
-          type="number"
-          min={1}
-          placeholder="Next invoice number"
-          value={form.nextInvoiceNumber}
-          onChange={(e) => setField('nextInvoiceNumber', parseInt(e.target.value, 10) || 1)}
-          required
-          aria-label="Next invoice number"
-        />
+        <p className="text-xs text-muted mt-2">
+          Numbers are auto-allocated per financial year, e.g. {form.invoicePrefix.replace(/[-/]+$/, '') || 'AL'}
+          /2026-27/0001
+        </p>
       </div>
       <button type="submit" className="btn-primary" disabled={saving}>
         {saving ? 'Saving...' : 'Save company profile'}

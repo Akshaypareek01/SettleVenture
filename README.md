@@ -35,7 +35,9 @@ npm run dev
 
 ## R2 Storage
 
-Add Cloudflare R2 credentials to `apps/api/.env`. Without creds, files save locally to `apps/api/uploads/`.
+Required. Set `R2_ENDPOINT`, keys, `R2_BUCKET_NAME`, and `R2_PUBLIC_BASE_URL`
+(`https://pub-….r2.dev` from Cloudflare R2 → bucket → Public access — **not** the S3 API host).
+Proofs are stored in R2 only; no local `uploads/` fallback.
 
 ## Project Structure
 

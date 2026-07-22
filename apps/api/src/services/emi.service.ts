@@ -1,6 +1,7 @@
 import { Types } from 'mongoose';
 import { PartnerVenture, Transaction, Partner } from '../models/index.js';
 import { toNumber } from '../utils/decimal.js';
+import { istMonth } from '../utils/dateIst.js';
 
 export interface PartnerEmiSummary {
   partnerId: string;
@@ -29,27 +30,40 @@ export interface VentureEmiSummary {
 }
 
 /**
- * Formats a Date as YYYY-MM in UTC.
+ * Formats a Date as YYYY-MM in IST (matches EMI period entry + GST months).
  * @param d - Date
  */
 export function toEmiPeriod(d: Date): string {
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
-  return `${y}-${m}`;
+  return istMonth(d);
 }
 
 /**
- * Lists YYYY-MM periods from start (inclusive) through now (inclusive).
+ * Lists the YYYY-MM periods due from start (inclusive), capped so they never
+ * run past the loan tenure or the current IST month — whichever comes first.
+ * A finished loan therefore stops accruing "due" months.
  * @param start - EMI start date
+ * @param tenureMonths - Total scheduled installments (null = uncapped by tenure)
  * @param now - Reference "now"
  */
-export function listEmiPeriodsThroughNow(start: Date, now = new Date()): string[] {
+export function listEmiPeriodsDue(
+  start: Date,
+  tenureMonths: number | null,
+  now = new Date()
+): string[] {
   const periods: string[] = [];
-  const cursor = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), 1));
-  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
-  while (cursor <= end) {
-    periods.push(toEmiPeriod(cursor));
-    cursor.setUTCMonth(cursor.getUTCMonth() + 1);
+  const startPeriod = istMonth(start);
+  const [sy, sm] = startPeriod.split('-').map(Number);
+  const [ey, em] = istMonth(now).split('-').map(Number);
+  let y = sy;
+  let m = sm;
+  while (y < ey || (y === ey && m <= em)) {
+    if (tenureMonths && periods.length >= tenureMonths) break;
+    periods.push(`${y}-${String(m).padStart(2, '0')}`);
+    m += 1;
+    if (m > 12) {
+      m = 1;
+      y += 1;
+    }
   }
   return periods;
 }
@@ -112,9 +126,9 @@ export async function computeVentureEmiSummary(ventureId: string): Promise<Ventu
     let overduePeriods: string[] = [];
     let monthsDue = 0;
     if (a.isEmiActive && a.emiStartDate) {
-      const allPeriods = listEmiPeriodsThroughNow(new Date(a.emiStartDate));
-      monthsDue = allPeriods.length;
-      overduePeriods = allPeriods.filter((period) => !paid.periods.has(period));
+      const duePeriods = listEmiPeriodsDue(new Date(a.emiStartDate), a.tenureMonths ?? null);
+      monthsDue = duePeriods.length;
+      overduePeriods = duePeriods.filter((period) => !paid.periods.has(period));
     }
 
     partners.push({

@@ -1,10 +1,11 @@
 # ApexLedger — Production Readiness: Flow Fixes & Optimization Plan
 
-> Scope: **India-only** business use (INR, GST, Indian banking). No payment gateway.
-> This is pure management software — partners + admin tracking money in/out of shared
-> ventures. This doc lists what is wrong or missing in the current build, what must be
-> fixed before real business data goes in, and how to optimize the flows, dashboard,
-> KPIs, and loading.
+> Scope: **India business use** (INR, GST, Indian banking — no i18n/multi-currency
+> needed). No payment gateway. Pure management software: partners + admin tracking
+> money in/out of shared ventures. This doc is the result of a full code audit
+> (backend + frontend) and lists what is wrong or missing, what must be fixed before
+> real business data goes in, and how to optimize the flows, dashboard, KPIs, and
+> loading. File:line references point at the exact code.
 
 ---
 
@@ -13,7 +14,7 @@
 ```
 Admin setup:  Types → Users → Company profile → Projects (+ bank accounts) → Assign partners
 Partner use:  Login → My Projects → open project →
-              Entries (add money movements + proof) → Bank cashbook → Earnings →
+              Entries (add money + proof) → Bank cashbook → Earnings →
               EMI board → Invoices → GST → Documents → Analysis (KPIs + settlement)
 Money model:  Partner Investment ↑pool ↑bank ↑contributed
               Direct Expense     ↑contributed only
@@ -24,247 +25,402 @@ Money model:  Partner Investment ↑pool ↑bank ↑contributed
 Settlement:   fairShare = Σ contributed / partnerCount ; net = contributed − fairShare
 ```
 
-The logic is right. The problems are in **correctness under real use, missing business
-flows (email, Excel, proper invoice print), data-loading efficiency, and the entry
-dashboard experience**.
+The business logic design is right. The problems are: **security holes, money-math
+correctness under real use, missing business flows (email, Excel, proper invoice
+print), inefficient data loading, and an entry experience with no dashboard.**
 
 ---
 
-## 2. CRITICAL correctness fixes (do these first — real money depends on them)
+## 2. CRITICAL security fixes — ✅ DONE (22 Jul 2026)
 
-### 2.1 Bank balance race condition → overdrafts possible
-`apps/api/src/utils/bankBalance.ts` — `assertSufficientBankBalance()` reads the balance,
-then the caller writes the transaction later. Two partners submitting outflows at the
-same moment **both pass the check** and the account goes negative.
+> Correction: the originally-reported "path traversal via `GET /files/local/*`" does
+> **not** exist in the current code — there is no local file serving; storage is
+> R2-only (`r2.service.ts`). Verified by direct read. The remaining findings were
+> real and are now fixed:
 
-**Fix:** run the balance check + transaction insert inside a MongoDB session/transaction,
-or maintain a `currentBalance` field on the bank-account subdocument updated with a
-conditional atomic op (`findOneAndUpdate` with `balance: { $gte: amount }` guard).
+1. ✅ **`POST /files/confirm` trusted client-controlled `r2Key`/`fileType`/`fileSizeBytes`.**
+   A forged `r2Key` could register an attachment pointing at another venture's
+   object (and deleting it would delete that other venture's file from R2).
+   **Fixed:** `r2Key` must match this venture's `ventures/{id}/proofs/…` pattern
+   (no `..`/`\`), MIME restricted to the allowlist enum, size bounded by
+   `MAX_FILE_SIZE_MB`, ObjectId-validated ids, duplicate-`r2Key` rejected (409).
+   `/presign` now also enforces the MIME allowlist.
 
-### 2.2 Balance computed by loading every transaction into JS
-`getBankAccountBalance()` does `Transaction.find(...)` and sums in a loop. It runs on
-**every outflow and every bank-page load**, and gets slower forever as the ledger grows.
+2. ✅ **No helmet, rate limiting only on login.**
+   **Fixed:** `helmet()` on the app, global `/api` limiter (1000/15min/IP),
+   upload/presign limiter (120/15min/IP), `trust proxy` set for correct IPs behind
+   a reverse proxy.
 
-**Fix:** one MongoDB aggregation (`$match` + `$group` with `$cond` on type), and/or a
-maintained running balance per account (recomputed by a nightly consistency job).
+3. ✅ **JWT hardcoded 7d expiry ignoring `JWT_EXPIRES_IN`; weak secret allowed.**
+   **Fixed:** expiry from env, issuer `apexledger` + HS256 pinned on sign/verify;
+   production boot now hard-fails on a <32-char or placeholder `JWT_SECRET` or a
+   localhost `MONGODB_URI` (`env.ts`). *(Refresh-token rotation still future work.)*
 
-### 2.3 `markInvoicePaid` is not atomic
-`apps/api/src/services/invoice.service.ts:231-255` — creates the `EARNING_IN`
-transaction, then updates attachments, then saves the invoice as three separate writes.
-A crash in between leaves an earning with no paid invoice (or vice-versa) — the bank
-cashbook and GST report silently disagree.
+4. ✅ **Any admin could reset another admin's password / deactivate admins.**
+   **Fixed:** admin accounts are only modifiable by their owner
+   (`admin.routes.ts` PATCH guard). Password policy raised to 8+ chars with a
+   letter and a number (create + update).
 
-**Fix:** wrap in `mongoose.startSession()` + `withTransaction()`. Same treatment for
-every multi-write flow (entry create + attachment link, cascade deletes).
+5. ✅ **Error handler leaked internals and guessed status by substring.**
+   **Fixed:** typed `AppError`, full zod field errors, generic 500 message in
+   production; also added `express-async-errors` so Express 4 async route
+   rejections reach the handler instead of hanging requests.
 
-### 2.4 Invoice numbers get burned / no financial-year series
-`allocateInvoiceNumber()` (invoice.service.ts:145) `$inc`s the counter **before** the
-invoice is successfully issued — any failure after allocation permanently skips a
-number. GST expects a **consecutive serial number series per financial year**
-(e.g. `AL/2025-26/0001`), and the current scheme is one global `AL-0001` counter with
-no FY reset and no gap protection.
+6. ✅ **Admin could create a transaction with an arbitrary `partnerId`** —
+   now ObjectId-validated and must be assigned to the venture
+   (`transactions.routes.ts`).
 
-**Fix:** allocate the number inside the same DB transaction as the issue operation;
-number format `PREFIX/FY/SEQ`; reset sequence each FY (Apr–Mar); keep cancelled
-invoices in the series (status `cancelled`, never deleted).
+7. ✅ **Ops wins done alongside:** health check now reports real Mongo state
+   (503 when disconnected), graceful SIGTERM/SIGINT shutdown with forced exit
+   fallback, seed script refuses to run when `NODE_ENV=production`.
 
-### 2.5 Bank accounts replaced wholesale on edit
-`apps/api/src/utils/bankAccounts.ts` — `mapBankAccounts()` rebuilds the subdocument
-array from the client payload. Removing an account from the admin editor can orphan
-every transaction that references its `bankAccountId`.
-
-**Fix:** never delete an account that has transactions — only `isActive: false`
-(deactivate). Server must enforce this, not the UI.
+**Still open (deliberately deferred):**
+- Plaintext password shown in the admin UI banner (`AdminPage.tsx:180`) — dies
+  naturally with invite/reset emails (§6).
+- Magic-byte sniffing of uploads (client MIME still trusted on `/upload`).
+- Refresh-token/session revocation.
 
 ---
 
-## 3. Invoice format & PRINT — not usable for a real Indian business yet
+## 3. CRITICAL money-correctness fixes — ✅ DONE (22 Jul 2026)
 
-What exists: a styled on-screen invoice card + `window.print()`
-(`apps/web/src/pages/project/ProjectInvoiceDetailPage.tsx:114,163-246`).
+> Infrastructure: local MongoDB converted to a single-node replica set (`rs0`) so
+> `withTxn()` transactions work; `MONGODB_URI` now carries `?replicaSet=rs0`. Use
+> Atlas (replica set by default) in production. A boot migration
+> (`config/migrate.ts`) collapses duplicate company profiles and syncs indexes.
+>
+> All items below were implemented and verified end-to-end against the running API:
+> - Overdraft of ₹9,99,999 against a ₹3,20,000 balance → correctly rejected;
+>   a valid ₹5,000 outflow committed and the balance moved to ₹3,15,000.
+> - Invoice issue produced `AL/2026-27/0001` then `0002` (FY series), GST split
+>   CGST ₹4,500 + SGST ₹4,500 on a ₹50,000 line.
+> - Mark-paid created the linked earning atomically and moved the bank balance;
+>   voiding that earning was blocked with a clear message.
+> - Settlement (now aggregation-based) nets to zero across partners.
+>
+> **What changed, mapped to the original findings:**
+> 1. ✅ Bank-balance race → overdraft: entry-create is now wrapped in `withTxn`,
+>    with a per-account `txnSeq` guard bump that forces concurrent debits on the
+>    same account to serialize (the loser retries against the committed balance).
+> 2. ✅ Float money math: `getBankAccountBalance` and `computeVentureSummary` now
+>    sum on Decimal128 inside MongoDB aggregations (also removes the N+1
+>    `Partner.findById` that ran inside the old JS loop).
+> 3. ✅ `markInvoicePaid` non-atomic: earning insert + attachment link + invoice
+>    flip now run in one transaction; voiding an earning linked to a **paid**
+>    invoice is blocked.
+> 4. ✅ EMI board: months-due now capped by `tenureMonths` (finished loans stop
+>    accruing "overdue"). *(Partial payments within a month remain legitimately
+>    additive — no false "double count" — so no unique constraint was forced.)*
+> 5. ✅ Settlement: converted to aggregation; equal-split and former-partner
+>    handling preserved. *(Per-partner `sharePct` for unequal ventures still
+>    deferred — noted below.)*
+> 6. ✅ Cascade integrity: deleting a venture now also removes its invoices;
+>    deleting a partner clears dangling `beneficiaryPartnerId` refs.
+> 7. ✅ Arbitrary `partnerId` on entry create: validated + assignment-checked
+>    (done in Phase 1).
+> 8. ✅ Invoice numbering racy/gapped: single company profile enforced via unique
+>    `singletonKey`; number allocated **inside** the issue transaction with a
+>    per-FY counter, so an aborted issue rolls the number back.
+> 9. ✅ Two sources of truth for bank balance: both the summary and the guard now
+>    use the same Decimal128 aggregation.
+>
+> **Still open (deferred):** per-partner ownership `sharePct`; monthly
+> reconciliation (§5); opening balances (§5); bank-to-bank transfer type (§5).
 
-Problems and the fixes:
+### Original findings (for reference)
+
+1. **Bank balance race → overdrafts.** Check-then-write with no atomicity:
+   `assertSufficientBankBalance` (`utils/bankBalance.ts:43-60`) then
+   `Transaction.create` (`transactions.routes.ts:159-168, 198`). Two concurrent
+   outflows both pass. **Fix:** Mongo session/transaction around check+insert, or a
+   maintained per-account balance updated via conditional atomic op.
+
+2. **All money math is JS floats.** Amounts are stored as Decimal128 but every
+   computation converts to float and loops: settlement (`settlement.service.ts:100-144`),
+   EMI (`emi.service.ts:76-142`), GST (`invoice.service.ts:322-352`), bank balance
+   (`bankBalance.ts:26-33`). Float accumulation over a growing ledger drifts.
+   **Fix:** sum in MongoDB aggregations on Decimal128 (this also fixes the
+   performance problems in §9), round only at the display edge.
+
+3. **`markInvoicePaid` is non-atomic and irreversible**
+   (`invoice.service.ts:231-255`): three separate writes (txn → attachments →
+   invoice); a crash desyncs cashbook and GST. And if the linked EARNING_IN is later
+   voided, the invoice stays `paid`. **Fix:** wrap in `withTransaction()`; block
+   voiding a transaction linked to a paid invoice (force un-mark-paid first).
+
+4. **EMI board bugs:**
+   - `tenureMonths` is never used — months-due accrues forever, fully-paid loans show
+     overdue indefinitely (`emi.service.ts:46-55, 112-118`).
+   - Duplicate payments for the same period double-count `paidAmount`
+     (`emi.service.ts:84-87`); no uniqueness on
+     `(ventureId, beneficiaryPartnerId, emiPeriod)`.
+
+5. **Settlement flaws:**
+   - Equal split is hardcoded (`settlement.service.ts:189`) — no per-partner
+     ownership % field. Fine if every venture is truly equal-share; add a
+     `sharePct` on the assignment now (default equal) so unequal ventures don't force
+     a schema migration later.
+   - Former partners' contributions count in totals but are excluded from the
+     settlement denominator (`:152, 173 vs :187-189`) — that money silently vanishes
+     from fair-share math. Decide the rule (freeze their row) and implement it
+     explicitly.
+
+6. **Cascade delete integrity:** deleting a venture hard-deletes transactions and
+   assignments but **leaves invoices orphaned** (`cascade.service.ts:25-31`);
+   deleting a partner leaves dangling `beneficiaryPartnerId` and invoice
+   `createdById` refs (`:37-45`). Also inconsistent with the soft-delete used
+   elsewhere. **Fix:** soft-close ventures instead of deleting once they have
+   transactions; cascade must cover every referencing collection and be audited.
+
+7. **Admin can create a transaction with an arbitrary, unvalidated `partnerId`**
+   (`transactions.routes.ts:141-142`) — not in the zod schema, not checked as
+   assigned to the venture. Validate ObjectId + assignment.
+
+8. **Invoice number allocation is racy and burns numbers.**
+   `getOrCreateCompanyProfile` findOne→create with no unique index → duplicate
+   singletons under concurrency (`invoice.service.ts:44-52`); the counter `$inc`s
+   before issue succeeds → gaps. GST expects a consecutive series per financial year.
+   **Fix:** unique index on the profile; allocate the number inside the issue
+   transaction; format `PREFIX/FY/SEQ` (e.g. `AL/2025-26/0042`) with FY (Apr–Mar)
+   reset; cancelled invoices stay in the series, never deleted.
+
+9. **Two sources of truth for bank balance** — summary's `byBankAccount`
+   (`settlement.service.ts:176-184`) computes it one way, `getBankAccountBalance`
+   another. One function/aggregation, used everywhere.
+
+---
+
+## 4. Invoice format & PRINT — not usable for a real Indian business yet
+
+What exists: styled on-screen card + `window.print()`
+(`ProjectInvoiceDetailPage.tsx:114, 163-246`).
 
 | # | Problem | Fix |
 |---|---------|-----|
-| 1 | **Dark theme prints as-is** — dark card, light text; wastes ink, looks wrong, some printers render it unreadable | Dedicated print stylesheet: `@media print` forces white background, black text, clean A4 layout with margins — or a separate `/print` route rendering a light-only invoice template |
-| 2 | **Not a legal GST tax invoice** — missing: "TAX INVOICE" title, HSN/SAC code per line, place of supply + state code, per-line GST rate, reverse-charge declaration, authorised signatory block | Extend the invoice model with `hsnSac`, `gstRate` **per line item**, `placeOfSupply`, `stateCode`; render all mandatory fields per CGST Rule 46 |
-| 3 | **Single GST rate for whole invoice** (`computeInvoiceMoney` takes one `gstRate`) — can't invoice 5% transport + 18% service together | Move GST rate (and HSN) to the line item; compute CGST/SGST/IGST per line, sum |
-| 4 | **Inter-state is a manual checkbox** — humans will get it wrong | Derive from GSTIN state codes: first 2 digits of company GSTIN vs customer GSTIN / place of supply. Keep manual override only for edge cases |
-| 5 | **No "Amount in words"** — expected on every Indian invoice | Add rupees-in-words helper (Indian numbering: lakh/crore) |
-| 6 | **No PDF** — print-only means no file to WhatsApp/email a customer | Server-side PDF generation (puppeteer or pdfkit) → `GET /api/invoices/:id/pdf`. This also becomes the email attachment (§5) |
-| 7 | **No copy labels** — "Original for Recipient / Duplicate for Transporter / Triplicate for Supplier" where relevant | Optional copy-type label on the print template |
-| 8 | **No partial payment / TDS** — `markInvoicePaid` books the full `totalAmount` as one earning | Support amount-received + TDS-deducted fields; book earning at actual received amount, track balance due on the invoice |
-
-Also: `computeGstSummary` buckets by **UTC month** (invoice.service.ts:310) — an
-invoice issued 1 Apr 00:30 IST lands in March. Use IST (`Asia/Kolkata`) when deriving
-the GST period, since GSTR filings are IST-month based.
+| 1 | **Dark theme prints as-is** — dark card, light text | `@media print` stylesheet forcing white/black clean A4 layout, or a dedicated light-only print route |
+| 2 | **Not a legal GST tax invoice** — missing "TAX INVOICE" title, HSN/SAC per line, place of supply + state code, per-line GST rate, reverse-charge declaration, authorised signatory block | Extend model: `hsnSac` + `gstRate` per **line item**, `placeOfSupply`, `stateCode`; render all CGST Rule 46 mandatory fields |
+| 3 | **One GST rate per invoice** (`computeInvoiceMoney`, `invoice.service.ts:116-140`) — can't mix 5% + 18% items | GST rate & HSN move to line items; compute per line, sum |
+| 4 | **Inter-state is a manual checkbox** | Derive from company vs customer GSTIN state codes (first 2 digits); manual override only |
+| 5 | **No "Amount in words"** | Rupees-in-words helper (lakh/crore) |
+| 6 | **No PDF** — print-only, nothing to WhatsApp/email a customer | Server-side PDF (`puppeteer`/`pdfkit`) → `GET /api/invoices/:id/pdf`; doubles as the email attachment (§6) |
+| 7 | **No partial payment / TDS** — full total booked as one earning | Amount-received + TDS fields; earning at actual received; balance-due tracked |
+| 8 | **GST months bucketed in UTC** (`invoice.service.ts:310`) — 1 Apr 00:30 IST invoice lands in March | Bucket GST periods in `Asia/Kolkata` (GSTR filings are IST months) |
+| 9 | **`PATCH /invoices/:id` multiplexes edit/issue/cancel via `body.action`** (`invoices.routes.ts:159-229`) | Separate endpoints: `POST /:id/issue`, `POST /:id/cancel`; PATCH edits drafts only |
+| 10 | **GST CSV export built client-side with no comma/quote escaping** (`ProjectGstPage.tsx:39-48`) | Server-generated export like the partner CSV — becomes the GSTR-1-shaped export in §7 |
 
 ---
 
-## 4. Bank management flow — missing pieces
+## 5. Bank management flow — missing pieces
 
-1. **No bank-to-bank transfer type.** Moving money HDFC Ops → SBI Pool currently
-   requires a fake outflow + fake investment, which corrupts both pool totals and
-   partner contributions. Add a `TRANSFER` transaction type (one txn, `fromAccountId`
-   + `toAccountId`, affects both cashbooks, affects **no** partner/settlement math).
-2. **No opening balance.** Real accounts start with money in them. Add
-   `openingBalance` + `openingDate` per bank account; ledger and balance math start
-   from there.
-3. **No reconciliation.** Add a simple monthly "reconcile" flow: enter the real bank
-   statement closing balance, app shows the difference vs computed balance, unmatched
-   entries get flagged. This is what makes people trust the numbers.
-4. **Cashbook needs running balance per row** (like a passbook), server-computed in the
-   same aggregation, not client-side.
-5. **Deactivation guard** (see §2.5) + show inactive accounts greyed-out with history
-   intact.
+1. **No bank-to-bank transfer type.** HDFC → SBI today needs a fake outflow + fake
+   investment, corrupting pool totals and partner contributions. Add `TRANSFER`
+   (one txn, `fromAccountId`/`toAccountId`, affects both cashbooks, affects **no**
+   partner/settlement math).
+2. **No opening balance.** Add `openingBalance` + `openingDate` per account.
+3. **No reconciliation.** Monthly reconcile flow: enter the statement closing
+   balance, show the difference vs computed, flag unmatched entries. This is what
+   makes partners trust the numbers.
+4. **Passbook-style running balance per row** in the cashbook, computed server-side
+   in the same aggregation.
+5. **Account deletion guard:** bank accounts are replaced wholesale from the client
+   payload (`utils/bankAccounts.ts:18-37`) — removing one orphans its transactions.
+   Server must refuse to remove an account with history; deactivate only.
 
 ---
 
-## 5. Email flow — completely missing (grep confirms: no mail library anywhere)
+## 6. Email flow — completely missing
 
-Nothing sends email today: no invites, no password reset, nothing. Minimum viable email
-layer for this business:
+No mail library exists anywhere. Minimum viable email layer:
 
 | Email | Trigger |
 |-------|---------|
-| **Account invite** with set-password link | Admin creates a user (today the admin types a password and must WhatsApp it — insecure) |
-| **Password reset** | "Forgot password" on login (doesn't exist today — a locked-out partner needs the admin + DB access) |
-| **Invoice PDF to customer** | "Send invoice" button on invoice detail (uses the PDF from §3.6) |
-| **Large-entry alert** (optional) | Entry above a configurable amount → other partners notified |
-| **Monthly summary** (optional) | 1st of month: each partner gets pool balance, their contributed, net settlement position |
+| **Account invite** with set-password link | Admin creates user (kills the plaintext-password banner, §2.6) |
+| **Password reset** | "Forgot password" on login (doesn't exist — a locked-out partner needs the admin + DB today) |
+| **Invoice PDF to customer** | "Send invoice" button (uses §4.6 PDF) |
+| **Large-entry alert** (optional) | Entry above configurable amount → other partners |
+| **Monthly summary** (optional) | 1st of month: pool balance, contributed, net settlement position |
 
-Implementation: `nodemailer` + any SMTP (Zoho/Google Workspace you already have, or
-SES). One `email.service.ts` with typed templates, fire-and-forget with retry (a failed
-email must never fail the API request). Add `SMTP_*` vars to `.env.example` and env
-validation.
-
----
-
-## 6. Excel flow — missing (planned in PROJECT-PLAN §9, never built)
-
-The whole point was replacing an Excel tracker, so both directions matter:
-
-**Import (one-time migration + ongoing bulk add):**
-- Admin uploads `.xlsx` → server parses with `exceljs`/`xlsx` (never trust
-  client-parsed data) → column-mapping step (Date / Type / Partner / Amount / Bank /
-  Category / Remark) → **validation preview screen** (row-level errors: unknown
-  partner, bad date, negative amount, unknown bank) → confirm → rows inserted in one
-  DB transaction, tagged with an `importBatchId` so a bad import can be rolled back as
-  a unit.
-
-**Export (accountant/CA handoff — this is what gets asked for at tax time):**
-- Per project: full ledger, bank cashbook, GST register (invoice-wise, matches GSTR-1
-  columns), settlement statement — as `.xlsx` with formatted headers, and date-range
-  filters. The CSV that exists today (`partner-analytics.service.ts`) covers only one
-  partner's view; extend to these project-level exports.
+Implementation: `nodemailer` + your SMTP (Zoho/Google Workspace/SES). One
+`email.service.ts` with typed templates; fire-and-forget with retry — a failed email
+must never fail the API request. `SMTP_*` in `.env.example` + env validation.
 
 ---
 
-## 7. Starting dashboard — straight-forward summary first, detail on demand
+## 7. Excel flow — missing (planned in PROJECT-PLAN §9, never built)
 
-Today login lands on a **project-card grid** with no numbers overview; every KPI lives
-inside a project. For "open the app, know where we stand in 5 seconds," add a real
-**Home dashboard** at `/app`:
+The product exists to replace an Excel tracker, so both directions matter:
 
-**Row 1 — 4 KPI cards (whole business, all my projects):**
-Total pool balance (all banks) · My total contributed · My net settlement position
-(owed / owes, coloured) · This month's in vs out.
+**Import (one-time migration + bulk add):** admin uploads `.xlsx` → server parses
+(`exceljs`) → column mapping (Date/Type/Partner/Amount/Bank/Category/Remark) →
+**row-level validation preview** (unknown partner, bad date, negative amount, unknown
+bank) → confirm → insert in one DB transaction tagged with `importBatchId` so a bad
+import rolls back as a unit.
 
-**Row 2 — Projects table (one row per assigned project):**
-name/type · pool balance · my contributed · my net position · last activity date →
-click = straight into that project's Entries. (Keep the card grid as a secondary
-view if liked, but the table is the workhorse.)
-
-**Row 3 — Recent activity (last 8–10 entries across projects)** with who/what/amount —
-this doubles as passive review of what other partners logged.
-
-**Rules to keep it clean (applies to every page):**
-- One number per card, label + value + small trend/sub-line. No decimals on big INR
-  amounts (`₹2.8L` style short format above 1 lakh).
-- Max 2 charts visible per screen; everything else behind the Analysis tab.
-- Charts that earn their place: partner contribution share (donut), monthly in/out
-  (grouped bars), category spend (horizontal bars, top 8 + "other"). Drop anything
-  that just restates a table.
-- Empty states everywhere ("No entries yet — Add your first entry") instead of blank
-  tables.
-
-**Backend for it:** one endpoint — `GET /api/dashboard/summary` — returning all of the
-above in a single response built from MongoDB aggregations. **Never** ship the pattern
-"fetch all transactions, compute KPIs in the browser."
+**Export (CA/accountant handoff — asked for at tax time):** per project, date-range
+filtered `.xlsx`: full ledger, bank cashbook, **GST register in GSTR-1 shape**
+(invoice-wise), settlement statement. The existing CSV
+(`partner-analytics.service.ts`) covers only one partner's view.
 
 ---
 
-## 8. Loading & performance optimization
+## 8. Flow & starting dashboard — the app has NO dashboard today
 
-1. **Server-side aggregation everywhere.** Every KPI/summary/balance currently at risk
-   of being computed by fetching full transaction lists (confirmed for bank balances,
-   §2.2, and GST summary which `find()`s all invoices then loops). Convert to
-   aggregation pipelines.
-2. **Indexes** to match query patterns: `Transaction {ventureId, date}`,
-   `{ventureId, bankAccountId, isDeleted}`, `{ventureId, type}`, `{partnerId, date}`;
-   `Invoice {ventureId, status, issueDate}`; `Attachment {ventureId, transactionId}`.
-   Verify with `.explain()` on the top 5 queries.
-3. **One request per page load.** Each project page should hydrate from a single
-   consolidated endpoint (header KPIs + first page of its list), not 3–5 sequential
-   fetches (waterfall). Audit each page's network tab.
-4. **Client caching:** adopt TanStack Query — cache per (project, tab), background
-   refetch, and **targeted invalidation on mutation** (adding an entry invalidates
-   that project's summary + entries list only, not a full-app refetch).
-5. **Route-level code splitting:** `React.lazy` per page (admin pages, invoice detail,
-   analysis with Recharts). Recharts alone is heavy — it must not be in the login/home
-   bundle. Check with `vite build` + bundle visualizer.
-6. **Skeleton loaders** for KPI cards and tables (not spinners, not layout jumps), and
-   a visible error + retry state on every fetch.
-7. **Pagination is server-side always** — entries, documents, audit — with sensible
-   default page size (25) and filters passed as query params.
-8. **Images/proofs:** thumbnails for the Documents grid (generate on upload or use
-   small presigned variants) — never load full-size receipt photos in a grid.
+Audit-confirmed reality of the current flow:
 
----
+- `/app` is just a **paginated project-card grid** with zero aggregate numbers
+  (`HomePage.tsx:100-129`); the sidebar even uses a dashboard icon for it
+  (`sidebarNav.ts:29`).
+- Opening a project **lands on the Add-Entry form** (`App.tsx:33` redirects to
+  `entries`, whose default sub-tab is `'add'` — `ProjectEntriesPage.tsx:15`). The
+  actual overview (Analysis) is **last** in the sidebar (`sidebarNav.ts:55`).
+- **There are no charts anywhere.** `recharts` is installed (`package.json:16`) but
+  never imported — "Analysis" is number tiles and tables only.
+- KPI tiles are duplicated with drifting names: header shows
+  Contributed/Pool/Earnings/Bank on every sub-page (`ProjectLayout.tsx:119-133`)
+  while Analysis re-renders overlapping tiles with different labels
+  (`ProjectAnalysisTab.tsx:25-72`).
+- `PartnerAnalyticsPage` renders inside the project chrome → double headers + 9 KPI
+  cards + full entry log = wall of data.
+- Sub-navigation is done three different ways (sidebar NavLinks, tab buttons, local
+  `mode` state not in the URL) — "create invoice"/"add earning" aren't linkable and
+  reset on refresh.
+- `ProjectComingSoonPage.tsx` is dead code (not routed).
 
-## 9. Production readiness checklist (beyond flows)
+### Target flow (straightforward: summary first, detail on demand)
 
-- [ ] **Mongo transactions** for all multi-write flows (needs replica-set mode — one
-      config flag on Atlas/self-hosted; document it).
-- [ ] **Timezone policy:** store UTC, display + bucket reports in IST. Fix GST month
-      bucketing (§3) and any `new Date(dateOnlyString)` boundary handling.
-- [ ] **Money as Decimal128 end-to-end** — audit every place amounts round-trip
-      through JS floats (`toNumber` in summaries is acceptable for display, not for
-      stored derived values).
-- [ ] **Auth hardening:** short-lived JWT + refresh, httpOnly secure cookie,
-      rate-limit login, password reset flow (§5), account lockout after N failures.
-- [ ] **Validation at the API edge** (zod on every route body/query — partially
-      present, make it universal).
-- [ ] **Audit log completeness:** every create/update/delete of transactions,
-      invoices, bank accounts, assignments writes an audit row — verify no mutating
-      endpoint skips it.
-- [ ] **Soft-delete only** for anything with money history; hard delete admin-only
-      and audited.
-- [ ] **Backups:** daily automated Mongo dump + R2 bucket versioning; test one
-      restore before go-live.
-- [ ] **Env validation on boot** (fail fast if JWT secret/DB URL/SMTP missing),
-      no default/dev secrets in production.
-- [ ] **Logging & errors:** structured logs (pino), central error handler that never
-      leaks stack traces to clients, uptime monitor on `/api/health`.
-- [ ] **Seed safety:** seed script must refuse to run when `NODE_ENV=production`
-      (it currently wipes collections).
-- [ ] **HTTPS + helmet + CORS locked to the real domain.**
+**A. Home dashboard at `/app`** (new — this is the starting screen):
+- Row 1 — 4 KPI cards across all my projects: total bank cash · my total contributed
+  · my net settlement position (owed/owes, coloured **with a text label**, not colour
+  alone) · this month in vs out.
+- Row 2 — projects table: name/type · pool balance · my contributed · my net ·
+  last activity → click straight into the project. (Card grid demoted or removed.)
+- Row 3 — recent activity: last 8–10 entries across projects (who/what/amount) —
+  doubles as passive review of what other partners logged.
+- Powered by ONE endpoint `GET /api/dashboard/summary` (server aggregations).
 
----
+**B. Project index lands on Analysis (overview), not the add form.** Sidebar order:
+Overview → Entries → Bank → Earnings → EMI → Invoices → GST → Documents. Keep a
+prominent "+ Add Entry" button in the project header from anywhere.
 
-## 10. Suggested order of work
+**C. Real charts on Analysis** (finally use recharts, lazy-loaded):
+- Partner contribution share — donut
+- Monthly money in vs out — grouped bars (time series)
+- Category spend — horizontal bars, top 8 + "Other"
+Max 2 charts visible per screen; drop any chart that restates a table.
 
-| Phase | Content | Why first |
-|-------|---------|-----------|
-| **1. Money correctness** | §2 all items + Mongo transactions + indexes | Nothing else matters if balances can be wrong |
-| **2. Invoice/GST compliance** | §3 print template, FY numbering, per-line HSN/GST, PDF | Legal requirement the moment a real invoice is issued |
-| **3. Bank flow completion** | §4 transfers, opening balance, running balance, reconcile | Makes the cashbook trustworthy day-to-day |
-| **4. Home dashboard + loading** | §7 + §8 | The daily-use experience |
-| **5. Email + Excel** | §5 + §6 | Onboarding, customer-facing invoices, CA handoff |
-| **6. Hardening** | §9 checklist | Before real data / real users |
+**D. De-duplicate KPIs:** the header band shows exactly 4 numbers with ONE canonical
+name each (Contributed · Pool balance · Bank cash · Earnings), only on pages where
+they're relevant; Analysis owns the detailed tiles. Pick one term per concept and use
+it everywhere (glossary: Contributed = investments + direct expenses).
+
+**E. Ledger readability:** entry lists become scannable table rows (date · type badge
+· partner · amount · bank · proof icon), not big cards with `text-2xl` amounts and
+inline thumbnails (`ProjectTransactionsTab.tsx:239, 273-275`). Amount short-format
+above 1 lakh (₹2.8L) in tiles; full value in tables/tooltips.
+
+**F. Every list/tab state goes in the URL** (sub-tab, filters, page) so refresh and
+share-links work.
 
 ---
 
-*Generated 22 Jul 2026. Sections 2–4 findings verified directly in code; file:line
-references point at the exact spots to change.*
+## 9. Loading & performance optimization
+
+### Backend
+1. **Kill the load-everything-into-JS pattern.** Confirmed hotspots that must become
+   MongoDB aggregations: `computeVentureSummary` loads the full transaction history
+   (`settlement.service.ts:54`), with `Partner.findById` **inside the loop** — N+1
+   (`:104`); bank balance (`bankBalance.ts:15-33`) runs on every outflow; GST summary
+   loads all invoices (`invoice.service.ts:305`); EMI does N+1 partner lookups
+   (`emi.service.ts:147`).
+2. **Admin dashboard is O(ventures × transactions)** — loops every venture calling
+   the full summary (`admin.routes.ts:40-53`). One aggregation across ventures.
+3. **Indexes to match queries:** `Transaction {ventureId, date}`,
+   `{ventureId, bankAccountId, isDeleted}`, `{ventureId, type}`; `Invoice
+   {ventureId, status, issueDate}`; verify with `.explain()`.
+4. **Admin assignments list loads the whole collection then paginates in JS**
+   (`adminAssignments.routes.ts:76-95`) — paginate in the query.
+5. **`getDownloadUrl` stats the disk per attachment per row** on every list
+   (`r2.service.ts:139-147`) — resolve lazily or batch.
+6. **Unhandled async route errors:** many `async` handlers have no try/catch and
+   Express 4 won't forward rejections (`ventures.routes.ts:21-162`,
+   `admin.routes.ts:40,59,201`, `files.routes.ts:146-222`, more) — requests hang.
+   Add `express-async-errors` or a `wrapAsync` helper on every route.
+
+### Frontend
+7. **Adopt TanStack Query.** Everything is raw `fetch` in `useEffect` — no cache, no
+   dedup, refetch-all on every navigation, manual `refreshKey` threading. This one
+   change also fixes:
+   - the **double initial fetch** (`ProjectTransactionsTab.tsx:81-83`,
+     `ProjectDocumentsTab.tsx:22-24`),
+   - the **race condition** in `usePaginatedList` (no AbortController — last
+     *arriving* response wins, `usePaginatedList.ts:45-66`),
+   - stale-after-mutation (targeted invalidation instead of refresh keys),
+   - the invoice list not resetting to page 1 after create
+     (`ProjectInvoicesPage.tsx:82`).
+8. **One request per page.** `AddEntryForm` fires 4 requests on mount including the
+   full venture summary just for account balances (`AddEntryForm.tsx:121-135`) —
+   pass layout data via outlet context / query cache.
+9. **Code-split routes.** Single 385 KB bundle, zero `React.lazy`. Lazy-load admin,
+   invoice detail, and Analysis (charts) at minimum.
+10. **Skeleton loaders** for KPI cards and tables (currently bare "Loading..." text
+    everywhere) + visible error-with-retry states; stop silently swallowing errors
+    (`.catch(() => setTypes([]))` — `HomePage.tsx:31`; `AdminPage.loadOptions` has
+    no catch at all, `AdminPage.tsx:46-59`).
+11. **401 handling:** `window.location.assign('/login')` from inside the fetch util
+    (`api.ts:17-23`) hard-reloads and loses state — route through the auth context.
+12. **Documents grid needs thumbnails**, not full-size receipt photos.
+
+---
+
+## 10. Production readiness checklist (beyond flows)
+
+- [ ] Mongo **replica set** so `withTransaction()` works (one flag on Atlas); wrap
+      all multi-write flows (§3).
+- [ ] **Timezone policy:** store UTC, display + bucket all reports (GST, EMI months,
+      monthly charts) in IST — EMI/GST currently bucket in UTC
+      (`emi.service.ts:35-38`, `invoice.service.ts:310`).
+- [ ] **Toast/notification system** + accessible modal primitive (focus trap,
+      Escape-to-close, scroll lock — none of the dialogs have these,
+      `ConfirmDialog.tsx:28-103`).
+- [ ] **Audit log every mutation** — today only transaction voids record who/when;
+      invoices, bank accounts, assignments, user changes have no trail.
+- [ ] **Soft-delete only** for anything with money history (cascade paths currently
+      hard-delete, §3.6).
+- [ ] **Structured logging** (pino) + request logging; central error handler (§2.7);
+      uptime monitor on a **real** health check that pings Mongo (currently static
+      `{status:'ok'}`, `app.ts:28-30`).
+- [ ] **Graceful shutdown** (SIGTERM drain — none today, `index.ts:8-19`).
+- [ ] **Env validation hard-fails in production** on default/placeholder secrets or
+      localhost DB (currently defaults slip through, `env.ts:10-11`).
+- [ ] **Seed guard:** refuse `npm run seed` when `NODE_ENV=production` (it wipes
+      collections).
+- [ ] **Backups:** nightly Mongo dump + R2 versioning; test one restore before
+      go-live.
+- [ ] **Consistent API envelope** (`{data}` / `{error: {message, fields}}` — zod
+      errors currently return only the first issue) and `/api/v1` prefix.
+- [ ] **Remove dead weight:** unused `recharts` (until §8C uses it), unrouted
+      `ProjectComingSoonPage`, unused `VITE_APP_NAME`; add the missing
+      `favicon.svg`.
+- [ ] Remove the hardcoded `@apexledger.local` email domain in admin user creation
+      (`AdminPage.tsx:151,171`) — real partner emails needed for §6.
+- [ ] HTTPS, helmet, CORS locked to the real domain.
+- [ ] Basic test coverage on the money math (settlement, bank balance, GST split,
+      EMI) — these are the functions that must never silently break.
+
+---
+
+## 11. Suggested order of work
+
+| Phase | Content | Why |
+|-------|---------|-----|
+| **1. Security** | §2: path traversal, files/confirm, helmet, JWT, admin guards | Exploitable today by any logged-in user |
+| **2. Money correctness** | §3 + Mongo transactions + aggregations + indexes | Wrong balances poison everything downstream |
+| **3. Invoice/GST compliance** | §4: print template, FY numbering, per-line HSN/GST, PDF | Legal requirement the moment a real invoice goes out |
+| **4. Bank flow completion** | §5: transfers, opening balance, running balance, reconcile | Makes the cashbook trustworthy day-to-day |
+| **5. Dashboard + flow + loading** | §8 + §9: home dashboard, land-on-overview, charts, react-query, code-split | The daily-use experience |
+| **6. Email + Excel** | §6 + §7 | Onboarding, customer invoices, CA handoff |
+| **7. Hardening** | §10 checklist | Before real users/data |
+
+---
+
+*Full-code audit, 22 Jul 2026. Every numbered finding carries the file:line to change.*

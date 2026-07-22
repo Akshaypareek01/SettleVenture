@@ -1,5 +1,5 @@
 import { Types } from 'mongoose';
-import { Attachment, PartnerVenture, Transaction, Venture } from '../models/index.js';
+import { Attachment, PartnerVenture, Transaction, Venture, Invoice } from '../models/index.js';
 import { deleteFile } from './r2.service.js';
 
 /**
@@ -27,6 +27,7 @@ export async function cascadeDeleteVenture(ventureId: Types.ObjectId): Promise<v
   await deleteAttachmentFiles(attachments);
   await Attachment.deleteMany({ ventureId });
   await Transaction.deleteMany({ ventureId });
+  await Invoice.deleteMany({ ventureId });
   await PartnerVenture.deleteMany({ ventureId });
 }
 
@@ -41,6 +42,12 @@ export async function cascadeDeletePartner(partnerId: Types.ObjectId): Promise<v
   await deleteAttachmentFiles(txnAttachments);
   await Attachment.deleteMany({ transactionId: { $in: txnIds } });
   await Transaction.deleteMany({ partnerId });
+  // Bank-paid EMIs where this partner was the beneficiary (but not the payer)
+  // stay on the ledger — clear the dangling beneficiary reference.
+  await Transaction.updateMany(
+    { beneficiaryPartnerId: partnerId },
+    { $unset: { beneficiaryPartnerId: '' } }
+  );
   await PartnerVenture.deleteMany({ partnerId });
 }
 

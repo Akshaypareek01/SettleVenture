@@ -8,6 +8,8 @@ export interface IBankAccount {
   bankName?: string;
   accountHint?: string;
   isActive: boolean;
+  /** Bumped inside each bank-affecting transaction to serialize concurrent debits. */
+  txnSeq: number;
   createdAt: Date;
 }
 
@@ -29,6 +31,7 @@ const bankAccountSchema = new Schema<IBankAccount>(
     bankName: { type: String, trim: true },
     accountHint: { type: String, trim: true },
     isActive: { type: Boolean, default: true },
+    txnSeq: { type: Number, default: 0 },
     createdAt: { type: Date, default: Date.now },
   },
   { _id: true }

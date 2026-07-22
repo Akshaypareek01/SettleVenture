@@ -37,7 +37,9 @@ router.get('/', async (_req: AuthRequest, res: Response): Promise<void> => {
 router.put('/', async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const data = profileSchema.parse(req.body);
-    const existing = await CompanyProfile.findOne();
+    // Ensure the single canonical profile exists, then update it by singletonKey
+    // so we never fork a second document.
+    await getOrCreateCompanyProfile();
     const payload = {
       firmName: data.firmName.trim(),
       address: data.address?.trim(),
@@ -57,9 +59,11 @@ router.put('/', async (req: AuthRequest, res: Response): Promise<void> => {
         : {}),
     };
 
-    const profile = existing
-      ? await CompanyProfile.findByIdAndUpdate(existing._id, payload, { new: true }).lean()
-      : (await CompanyProfile.create({ ...payload, invoicePrefix: data.invoicePrefix ?? 'AL-', nextInvoiceNumber: data.nextInvoiceNumber ?? 1 })).toObject();
+    const profile = await CompanyProfile.findOneAndUpdate(
+      { singletonKey: 'company' },
+      payload,
+      { new: true }
+    ).lean();
 
     res.json(profile);
   } catch (err) {

@@ -91,6 +91,35 @@ router.patch('/:id', async (req: AuthRequest, res: Response): Promise<void> => {
         res.status(400).json({ error: 'Keep at least one bank account on the project' });
         return;
       }
+
+      const existing = await Venture.findById(req.params.id).lean();
+      if (!existing) {
+        res.status(404).json({ error: 'Project not found' });
+        return;
+      }
+
+      const keepIds = new Set(
+        data.bankAccounts
+          .map((a) => a._id)
+          .filter((id): id is string => Boolean(id && mongoose.Types.ObjectId.isValid(id)))
+      );
+      const removed = (existing.bankAccounts ?? []).filter((a) => !keepIds.has(String(a._id)));
+      if (removed.length) {
+        const removedIds = removed.map((a) => a._id);
+        const linked = await Transaction.countDocuments({
+          ventureId: existing._id,
+          bankAccountId: { $in: removedIds },
+          isDeleted: false,
+        });
+        if (linked > 0) {
+          const labels = removed.map((a) => a.label).join(', ');
+          res.status(400).json({
+            error: `Cannot remove bank account(s) with history (${labels}). Deactivate them instead.`,
+          });
+          return;
+        }
+      }
+
       updates.bankAccounts = mapBankAccounts(data.bankAccounts);
     }
 

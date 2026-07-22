@@ -5,6 +5,7 @@ export interface IAttachment extends Document {
   ventureId: Types.ObjectId;
   transactionId?: Types.ObjectId;
   r2Key: string;
+  publicUrl?: string;
   fileName: string;
   fileType: string;
   fileSizeBytes: number;
@@ -17,6 +18,7 @@ const attachmentSchema = new Schema<IAttachment>(
     ventureId: { type: Schema.Types.ObjectId, ref: 'Venture', required: true },
     transactionId: { type: Schema.Types.ObjectId, ref: 'Transaction' },
     r2Key: { type: String, required: true },
+    publicUrl: { type: String, trim: true },
     fileName: { type: String, required: true },
     fileType: { type: String, required: true },
     fileSizeBytes: { type: Number, required: true },

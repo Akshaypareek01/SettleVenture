@@ -1,7 +1,7 @@
 import { Router, Response } from 'express';
 import { z } from 'zod';
 import mongoose from 'mongoose';
-import { Transaction, Attachment, Venture, Partner } from '../models/index.js';
+import { Transaction, Attachment, Venture, Partner, PartnerVenture, Invoice } from '../models/index.js';
 import { AuthRequest, requireAuth, requireVentureAccess } from '../middleware/auth.middleware.js';
 import { toDecimalString, toNumber } from '../utils/decimal.js';
 import { getDownloadUrl } from '../services/r2.service.js';
@@ -15,6 +15,8 @@ import {
 } from '../utils/txnCreate.js';
 import { assertSufficientBankBalance } from '../utils/bankBalance.js';
 import { assertAttachmentsForCreate } from '../utils/attachments.js';
+import { withTxn } from '../utils/withTxn.js';
+import { AppError } from '../middleware/error.middleware.js';
 
 const router = Router({ mergeParams: true });
 
@@ -54,7 +56,7 @@ async function mapTransactions(txns: TransactionLean[]) {
           id: a._id,
           fileName: a.fileName,
           fileType: a.fileType,
-          downloadUrl: await getDownloadUrl(a.r2Key),
+          downloadUrl: await getDownloadUrl(a.r2Key, a.publicUrl),
         }))
       ),
     }))
@@ -138,8 +140,20 @@ router.post('/', requireVentureAccess, async (req: AuthRequest, res: Response): 
     }
 
     const data = createTxnSchema.parse(req.body);
-    const partnerId =
-      req.user!.role === 'admin' && req.body.partnerId ? req.body.partnerId : req.user!._id;
+    let partnerId: mongoose.Types.ObjectId = req.user!._id;
+    if (req.user!.role === 'admin' && req.body.partnerId) {
+      const raw = String(req.body.partnerId);
+      if (!mongoose.Types.ObjectId.isValid(raw)) {
+        res.status(400).json({ error: 'Invalid partnerId' });
+        return;
+      }
+      const assigned = await PartnerVenture.findOne({ partnerId: raw, ventureId }).lean();
+      if (!assigned) {
+        res.status(400).json({ error: 'Partner is not assigned to this project' });
+        return;
+      }
+      partnerId = new mongoose.Types.ObjectId(raw);
+    }
 
     const bankReq = assertBankAccountRequirement(venture, data.type, data.bankAccountId);
     if (!bankReq.ok) {
@@ -155,17 +169,6 @@ router.post('/', requireVentureAccess, async (req: AuthRequest, res: Response): 
         return;
       }
       bankFields = resolved;
-
-      const balanceCheck = await assertSufficientBankBalance(
-        ventureId,
-        data.bankAccountId,
-        data.amount,
-        data.type
-      );
-      if (!balanceCheck.ok) {
-        res.status(400).json({ error: balanceCheck.error });
-        return;
-      }
     }
 
     const categoryResult = await resolveCategoryFields(ventureId, data);
@@ -195,30 +198,68 @@ router.post('/', requireVentureAccess, async (req: AuthRequest, res: Response): 
       emiPeriod = data.emiPeriod;
     }
 
-    const txn = await Transaction.create({
-      ventureId,
-      type: data.type,
-      partnerId,
-      amount: mongoose.Types.Decimal128.fromString(toDecimalString(data.amount)),
-      date: new Date(data.date),
-      paidFrom: data.paidFrom?.trim() || undefined,
-      paidTo: data.paidTo?.trim() || undefined,
-      remark: data.remark?.trim() || undefined,
-      ...bankFields,
-      ...categoryResult.fields,
-      beneficiaryPartnerId,
-      emiPeriod,
-      createdById: req.user!._id,
-    });
+    // Atomic write: serialize per-account (guard bump), re-check balance inside the
+    // transaction, insert the entry, and link attachments — all or nothing.
+    let txnId: mongoose.Types.ObjectId;
+    try {
+      txnId = await withTxn(async (session) => {
+        if (bankFields.bankAccountId) {
+          // Bumping txnSeq forces concurrent debits on the same account to
+          // write-conflict, so withTxn retries the loser against a fresh balance.
+          await Venture.updateOne(
+            { _id: ventureId, 'bankAccounts._id': bankFields.bankAccountId },
+            { $inc: { 'bankAccounts.$.txnSeq': 1 } },
+            { session }
+          );
+          const balanceCheck = await assertSufficientBankBalance(
+            ventureId,
+            String(bankFields.bankAccountId),
+            data.amount,
+            data.type,
+            session
+          );
+          if (!balanceCheck.ok) throw new AppError(balanceCheck.error, 400);
+        }
 
-    if (data.attachmentIds?.length) {
-      await Attachment.updateMany(
-        { _id: { $in: data.attachmentIds }, ventureId },
-        { transactionId: txn._id }
-      );
+        const [created] = await Transaction.create(
+          [
+            {
+              ventureId,
+              type: data.type,
+              partnerId,
+              amount: mongoose.Types.Decimal128.fromString(toDecimalString(data.amount)),
+              date: new Date(data.date),
+              paidFrom: data.paidFrom?.trim() || undefined,
+              paidTo: data.paidTo?.trim() || undefined,
+              remark: data.remark?.trim() || undefined,
+              ...bankFields,
+              ...categoryResult.fields,
+              beneficiaryPartnerId,
+              emiPeriod,
+              createdById: req.user!._id,
+            },
+          ],
+          { session }
+        );
+
+        if (data.attachmentIds?.length) {
+          await Attachment.updateMany(
+            { _id: { $in: data.attachmentIds }, ventureId },
+            { transactionId: created._id },
+            { session }
+          );
+        }
+        return created._id;
+      });
+    } catch (err) {
+      if (err instanceof AppError) {
+        res.status(err.status).json({ error: err.message });
+        return;
+      }
+      throw err;
     }
 
-    const populated = await Transaction.findById(txn._id)
+    const populated = await Transaction.findById(txnId)
       .populate('partnerId', 'name email')
       .populate('beneficiaryPartnerId', 'name email')
       .lean();
@@ -285,6 +326,22 @@ router.delete(
       if (!isAdmin && !isCreator && !isOwner) {
         res.status(403).json({ error: 'You can only void your own entries' });
         return;
+      }
+
+      // Voiding a paid-invoice earning would desync the invoice from the ledger.
+      if (txn.type === 'EARNING_IN') {
+        const linkedInvoice = await Invoice.findOne({
+          linkedEarningTransactionId: txn._id,
+          status: 'paid',
+        })
+          .select('number')
+          .lean();
+        if (linkedInvoice) {
+          res.status(400).json({
+            error: `This earning is linked to paid invoice ${linkedInvoice.number ?? ''}. Un-mark the invoice as paid before voiding.`,
+          });
+          return;
+        }
       }
 
       txn.isDeleted = true;

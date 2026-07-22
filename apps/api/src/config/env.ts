@@ -22,6 +22,23 @@ const envSchema = z.object({
 
 export const env = envSchema.parse(process.env);
 
+// Production must never run on dev defaults — fail fast at boot.
+if (env.NODE_ENV === 'production') {
+  const problems: string[] = [];
+  if (env.JWT_SECRET.length < 32) {
+    problems.push('JWT_SECRET must be at least 32 characters in production');
+  }
+  if (/change|example|placeholder|secret123|your[-_]?secret/i.test(env.JWT_SECRET)) {
+    problems.push('JWT_SECRET looks like a placeholder — generate a real random secret');
+  }
+  if (/localhost|127\.0\.0\.1/.test(env.MONGODB_URI)) {
+    problems.push('MONGODB_URI points at localhost in production');
+  }
+  if (problems.length) {
+    throw new Error(`Unsafe production configuration:\n- ${problems.join('\n- ')}`);
+  }
+}
+
 /**
  * Resolves the R2 S3-compatible endpoint URL.
  * Prefers R2_ENDPOINT; falls back to account-id URL pattern.
@@ -54,9 +71,21 @@ export function isR2Configured(): boolean {
   return Boolean(endpoint && accessKeyId && secretAccessKey && env.R2_BUCKET_NAME);
 }
 
-/** @returns true when public file URLs can be built */
+/** @returns true when public file URLs can be built with a non-S3-API base */
 export function isPublicUrlConfigured(): boolean {
-  return Boolean(env.R2_PUBLIC_BASE_URL.trim());
+  const base = env.R2_PUBLIC_BASE_URL.trim();
+  return Boolean(base) && isValidPublicBaseUrl(base);
+}
+
+/**
+ * Public base must be r2.dev / custom domain — never the S3 API host.
+ * @param base - Candidate R2_PUBLIC_BASE_URL
+ */
+export function isValidPublicBaseUrl(base: string): boolean {
+  const normalized = base.trim().toLowerCase().replace(/\/$/, '');
+  if (!normalized.startsWith('http://') && !normalized.startsWith('https://')) return false;
+  if (normalized.includes('.r2.cloudflarestorage.com')) return false;
+  return true;
 }
 
 /**
@@ -65,7 +94,7 @@ export function isPublicUrlConfigured(): boolean {
  */
 export function getPublicFileUrl(r2Key: string): string | null {
   const base = env.R2_PUBLIC_BASE_URL.trim().replace(/\/$/, '');
-  if (!base) return null;
+  if (!base || !isValidPublicBaseUrl(base)) return null;
   return `${base}/${r2Key.split('/').map(encodeURIComponent).join('/')}`;
 }
 
@@ -78,9 +107,15 @@ export function assertFileStorageReady(): void {
       'File storage is not configured. Set R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, and R2_BUCKET_NAME in .env'
     );
   }
-  if (!isPublicUrlConfigured()) {
+  const base = env.R2_PUBLIC_BASE_URL.trim();
+  if (!base) {
     throw new Error(
-      'R2_PUBLIC_BASE_URL is required (your bucket public URL or custom domain, no trailing slash)'
+      'R2_PUBLIC_BASE_URL is required — use the bucket public URL (https://pub-xxxx.r2.dev) or custom domain, not the S3 API endpoint'
+    );
+  }
+  if (!isValidPublicBaseUrl(base)) {
+    throw new Error(
+      'R2_PUBLIC_BASE_URL cannot be the S3 API host (*.r2.cloudflarestorage.com). Enable Public access on the bucket and paste the https://pub-….r2.dev URL'
     );
   }
 }

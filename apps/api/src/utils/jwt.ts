@@ -13,7 +13,10 @@ export interface JwtPayload {
  * @param payload - User identity fields
  */
 export function signToken(payload: JwtPayload): string {
-  return jwt.sign(payload, env.JWT_SECRET, { expiresIn: '7d' });
+  return jwt.sign(payload, env.JWT_SECRET, {
+    expiresIn: env.JWT_EXPIRES_IN as jwt.SignOptions['expiresIn'],
+    issuer: 'apexledger',
+  });
 }
 
 /**
@@ -21,5 +24,8 @@ export function signToken(payload: JwtPayload): string {
  * @param token - JWT string from cookie or header
  */
 export function verifyToken(token: string): JwtPayload {
-  return jwt.verify(token, env.JWT_SECRET) as JwtPayload;
+  return jwt.verify(token, env.JWT_SECRET, {
+    issuer: 'apexledger',
+    algorithms: ['HS256'],
+  }) as JwtPayload;
 }

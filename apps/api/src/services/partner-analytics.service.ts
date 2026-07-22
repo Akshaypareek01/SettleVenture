@@ -127,7 +127,7 @@ export async function computePartnerVentureAnalytics(
             id: String(a._id),
             fileName: a.fileName,
             fileType: a.fileType,
-            downloadUrl: await getDownloadUrl(a.r2Key),
+            downloadUrl: await getDownloadUrl(a.r2Key, a.publicUrl),
           }))
         ),
       };

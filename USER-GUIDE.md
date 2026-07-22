@@ -159,7 +159,7 @@ All uploaded proofs across entries — preview / download (and delete if allowed
 
 ## 5. Admin journey (setup flow)
 
-**Sidebar → Admin** (`/app/admin`)
+**Sidebar → Admin** (`/app/admin/users`, or Types / Projects / Assign / Company)
 
 Recommended order:
 
@@ -239,7 +239,7 @@ Admins also see **all** projects on My Projects (incl. closed) and the **settlem
 
 ## 9. Ops notes
 
-- **Files:** R2 if configured; else local `apps/api/uploads/`. Max size from `MAX_FILE_SIZE_MB`.  
+- **Files:** Cloudflare R2 only — set `R2_*` + `R2_PUBLIC_BASE_URL` (`https://pub-….r2.dev`). Max size from `MAX_FILE_SIZE_MB`.  
 - **Auth:** JWT cookie; logout from sidebar.  
 - **Seed** wipes demo collections — don’t run against production data.
 

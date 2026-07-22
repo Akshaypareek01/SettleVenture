@@ -212,11 +212,13 @@ function CreateUserForm({ onCreated }: CreateUserFormProps) {
       <input
         className="input-field"
         type={showPassword ? 'text' : 'password'}
-        placeholder="Password (min 6)"
+        placeholder="Password (8+ chars, letter + number)"
         value={password}
         onChange={(e) => setPassword(e.target.value)}
         required
-        minLength={6}
+        minLength={8}
+        pattern="(?=.*[A-Za-z])(?=.*\d).{8,}"
+        title="At least 8 characters with a letter and a number"
         aria-label="Password"
       />
       <label className="flex items-center gap-2 text-sm text-muted cursor-pointer">
