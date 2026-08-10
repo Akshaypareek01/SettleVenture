@@ -4,7 +4,10 @@ export type TransactionType =
   | 'VENDOR_PAYMENT_OUT'
   | 'EARNING_IN'
   | 'EMI_PERSONAL'
-  | 'EMI_FROM_BANK';
+  | 'EMI_FROM_BANK'
+  | 'PARTNER_TRANSFER';
+
+export type TransferBucket = 'INVESTMENT' | 'EXPENSE';
 
 export interface EntryTypeOption {
   value: TransactionType;
@@ -62,8 +65,19 @@ export function transactionTypeLabel(type?: string): string {
     EARNING_IN: 'Earning',
     EMI_PERSONAL: 'EMI (personal)',
     EMI_FROM_BANK: 'EMI from bank',
+    PARTNER_TRANSFER: 'Partner transfer',
   };
   return labels[type ?? ''] ?? 'Entry';
+}
+
+/**
+ * Label for a fair-share transfer bucket.
+ * @param bucket - INVESTMENT or EXPENSE
+ */
+export function transferBucketLabel(bucket?: string): string {
+  if (bucket === 'INVESTMENT') return 'Investment';
+  if (bucket === 'EXPENSE') return 'Direct Expense';
+  return 'Transfer';
 }
 
 /**
@@ -78,6 +92,7 @@ export function transactionTypeBadgeClass(type?: string): string {
     EARNING_IN: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30',
     EMI_PERSONAL: 'bg-violet-500/15 text-violet-300 border-violet-500/30',
     EMI_FROM_BANK: 'bg-fuchsia-500/15 text-fuchsia-300 border-fuchsia-500/30',
+    PARTNER_TRANSFER: 'bg-sky-500/15 text-sky-300 border-sky-500/30',
   };
   return classes[type ?? ''] ?? 'bg-elevated text-muted border-border';
 }

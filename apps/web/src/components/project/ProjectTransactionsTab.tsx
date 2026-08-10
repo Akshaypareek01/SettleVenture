@@ -2,7 +2,11 @@ import { useEffect, useMemo, useState } from 'react';
 import { Users } from 'lucide-react';
 import { api, Transaction } from '../../lib/api';
 import { formatDate, formatINR } from '../../lib/format';
-import { transactionTypeBadgeClass, transactionTypeLabel } from '../../lib/transactionTypes';
+import {
+  transactionTypeBadgeClass,
+  transactionTypeLabel,
+  transferBucketLabel,
+} from '../../lib/transactionTypes';
 import { usePaginatedList } from '../../hooks/usePaginatedList';
 import { useAuth } from '../../contexts/AuthContext';
 import ListToolbar from '../ui/ListToolbar';
@@ -39,6 +43,7 @@ const TYPE_FILTER_OPTIONS = [
   { value: 'EARNING_IN', label: 'Earning' },
   { value: 'EMI_PERSONAL', label: 'EMI (personal)' },
   { value: 'EMI_FROM_BANK', label: 'EMI from bank' },
+  { value: 'PARTNER_TRANSFER', label: 'Partner transfer' },
 ];
 
 /**
@@ -114,7 +119,9 @@ export default function ProjectTransactionsTab({
       {mode === 'all' && !bankAccountId && (
         <div className="flex items-center gap-2 text-muted text-sm mb-2">
           <Users className="w-4 h-4" aria-hidden="true" />
-          All project entries — investments, expenses, outflows, earnings &amp; EMI
+          {fixedType === 'PARTNER_TRANSFER'
+            ? 'Partner-to-partner settlement transfers (fair share only)'
+            : 'All project entries — investments, expenses, outflows, earnings & EMI'}
         </div>
       )}
 
@@ -134,9 +141,11 @@ export default function ProjectTransactionsTab({
         <div className="card text-center py-8 text-muted">
           {bankAccountId
             ? 'No movements on this account yet.'
-            : mode === 'mine'
-              ? "You haven't logged any entries yet."
-              : 'No entries yet.'}
+            : fixedType === 'PARTNER_TRANSFER'
+              ? 'No partner transfers logged yet.'
+              : mode === 'mine'
+                ? "You haven't logged any entries yet."
+                : 'No entries yet.'}
         </div>
       ) : (
         list.items.map((t) => (
@@ -227,20 +236,32 @@ function EntryCard({
             >
               {transactionTypeLabel(transaction.type)}
             </span>
+            {transaction.transferBucket && (
+              <span className="text-xs px-2 py-0.5 rounded-full border border-border text-muted">
+                {transferBucketLabel(transaction.transferBucket)}
+              </span>
+            )}
             {transaction.categoryName && (
               <span className="text-xs px-2 py-0.5 rounded-full border border-border text-muted">
                 {transaction.categoryName}
               </span>
             )}
-            {showPartner && (
+            {showPartner && transaction.type !== 'PARTNER_TRANSFER' && (
               <span className="font-semibold">{transaction.partnerId.name}</span>
             )}
           </div>
           <p className="text-2xl font-bold text-accent">{formatINR(transaction.amount)}</p>
+          {transaction.type === 'PARTNER_TRANSFER' && (
+            <p className="text-sm mt-2 font-medium">
+              {transaction.partnerId.name}
+              <span className="text-muted font-normal"> → </span>
+              {beneficiaryName ?? transaction.paidTo ?? 'Partner'}
+            </p>
+          )}
           {transaction.bankAccountLabel && (
             <p className="text-sm text-muted mt-2">Account: {transaction.bankAccountLabel}</p>
           )}
-          {beneficiaryName && (
+          {beneficiaryName && transaction.type !== 'PARTNER_TRANSFER' && (
             <p className="text-sm text-muted mt-1">EMI for: {beneficiaryName}</p>
           )}
           {transaction.emiPeriod && (
@@ -249,7 +270,7 @@ function EntryCard({
           {transaction.paidFrom && (
             <p className="text-sm text-muted mt-1">From: {transaction.paidFrom}</p>
           )}
-          {transaction.paidTo && (
+          {transaction.paidTo && transaction.type !== 'PARTNER_TRANSFER' && (
             <p className="text-sm text-muted mt-1">To: {transaction.paidTo}</p>
           )}
           {transaction.remark && <p className="text-sm mt-1">{transaction.remark}</p>}

@@ -15,6 +15,7 @@ export const createTxnSchema = z
         'EARNING_IN',
         'EMI_PERSONAL',
         'EMI_FROM_BANK',
+        'PARTNER_TRANSFER',
       ])
       .default('CONTRIBUTION_IN'),
     amount: z.number().positive(),
@@ -26,6 +27,7 @@ export const createTxnSchema = z
     bankAccountId: z.string().optional(),
     categoryId: z.string().optional(),
     beneficiaryPartnerId: z.string().optional(),
+    transferBucket: z.enum(['INVESTMENT', 'EXPENSE']).optional(),
     emiPeriod: z.string().optional(),
   })
   .superRefine((data, ctx) => {
@@ -52,6 +54,22 @@ export const createTxnSchema = z
         message: 'Beneficiary partner is required for EMI from bank',
         path: ['beneficiaryPartnerId'],
       });
+    }
+    if (data.type === 'PARTNER_TRANSFER') {
+      if (!data.beneficiaryPartnerId) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Receiver partner is required',
+          path: ['beneficiaryPartnerId'],
+        });
+      }
+      if (!data.transferBucket) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Transfer bucket (Investment or Expense) is required',
+          path: ['transferBucket'],
+        });
+      }
     }
   });
 
@@ -153,6 +171,42 @@ export async function assertEmiBeneficiary(
     return { ok: false, error: 'EMI is not active for this partner on this project' };
   }
   return { ok: true };
+}
+
+/**
+ * Validates a partner-to-partner fair-share settlement transfer.
+ * @param ventureId - Venture id
+ * @param payerId - Partner giving money
+ * @param receiverId - Partner receiving money
+ */
+export async function assertPartnerTransfer(
+  ventureId: string,
+  payerId: string,
+  receiverId: string
+): Promise<{ ok: true; receiverName: string } | { ok: false; error: string }> {
+  if (!mongoose.Types.ObjectId.isValid(receiverId)) {
+    return { ok: false, error: 'Invalid receiver partner' };
+  }
+  if (String(payerId) === String(receiverId)) {
+    return { ok: false, error: 'Cannot transfer to yourself' };
+  }
+
+  const [payerAssignment, receiverAssignment] = await Promise.all([
+    PartnerVenture.findOne({ ventureId, partnerId: payerId }).populate('partnerId', 'name').lean(),
+    PartnerVenture.findOne({ ventureId, partnerId: receiverId })
+      .populate('partnerId', 'name')
+      .lean(),
+  ]);
+
+  if (!payerAssignment) {
+    return { ok: false, error: 'Payer is not assigned to this project' };
+  }
+  if (!receiverAssignment) {
+    return { ok: false, error: 'Receiver is not assigned to this project' };
+  }
+
+  const receiver = receiverAssignment.partnerId as unknown as { name?: string };
+  return { ok: true, receiverName: receiver.name ?? 'Partner' };
 }
 
 /**

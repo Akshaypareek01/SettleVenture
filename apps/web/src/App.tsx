@@ -8,6 +8,7 @@ import ProjectLayout from './components/project/ProjectLayout';
 import ProjectEntriesPage from './pages/project/ProjectEntriesPage';
 import ProjectDocumentsPage from './pages/project/ProjectDocumentsPage';
 import ProjectAnalysisPage from './pages/project/ProjectAnalysisPage';
+import ProjectFairSharePage from './pages/project/ProjectFairSharePage';
 import ProjectBankPage from './pages/project/ProjectBankPage';
 import ProjectBankAccountPage from './pages/project/ProjectBankAccountPage';
 import ProjectEarningsPage from './pages/project/ProjectEarningsPage';
@@ -34,6 +35,7 @@ export default function App() {
             <Route path="entries" element={<ProjectEntriesPage />} />
             <Route path="documents" element={<ProjectDocumentsPage />} />
             <Route path="analysis" element={<ProjectAnalysisPage />} />
+            <Route path="fair-share" element={<ProjectFairSharePage />} />
             <Route path="bank" element={<ProjectBankPage />} />
             <Route path="bank/:accountId" element={<ProjectBankAccountPage />} />
             <Route path="earnings" element={<ProjectEarningsPage />} />

@@ -6,7 +6,10 @@ export type TransactionType =
   | 'EXPENSE'
   | 'EARNING_IN'
   | 'EMI_PERSONAL'
-  | 'EMI_FROM_BANK';
+  | 'EMI_FROM_BANK'
+  | 'PARTNER_TRANSFER';
+
+export type TransferBucket = 'INVESTMENT' | 'EXPENSE';
 
 export interface ITransaction extends Document {
   _id: Types.ObjectId;
@@ -23,6 +26,8 @@ export interface ITransaction extends Document {
   categoryId?: Types.ObjectId;
   categoryName?: string;
   beneficiaryPartnerId?: Types.ObjectId;
+  /** Fair-share bucket for PARTNER_TRANSFER only */
+  transferBucket?: TransferBucket;
   emiPeriod?: string;
   createdById: Types.ObjectId;
   isDeleted: boolean;
@@ -44,6 +49,7 @@ const transactionSchema = new Schema<ITransaction>(
         'EARNING_IN',
         'EMI_PERSONAL',
         'EMI_FROM_BANK',
+        'PARTNER_TRANSFER',
       ],
       required: true,
     },
@@ -58,6 +64,10 @@ const transactionSchema = new Schema<ITransaction>(
     categoryId: { type: Schema.Types.ObjectId, ref: 'Category' },
     categoryName: { type: String, trim: true },
     beneficiaryPartnerId: { type: Schema.Types.ObjectId, ref: 'Partner' },
+    transferBucket: {
+      type: String,
+      enum: ['INVESTMENT', 'EXPENSE'],
+    },
     emiPeriod: { type: String, trim: true },
     createdById: { type: Schema.Types.ObjectId, ref: 'Partner', required: true },
     isDeleted: { type: Boolean, default: false },

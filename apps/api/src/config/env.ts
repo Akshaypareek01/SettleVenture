@@ -31,8 +31,14 @@ if (env.NODE_ENV === 'production') {
   if (/change|example|placeholder|secret123|your[-_]?secret/i.test(env.JWT_SECRET)) {
     problems.push('JWT_SECRET looks like a placeholder — generate a real random secret');
   }
-  if (/localhost|127\.0\.0\.1/.test(env.MONGODB_URI)) {
-    problems.push('MONGODB_URI points at localhost in production');
+  // Single-box EC2 may run Mongo locally — set ALLOW_LOCAL_MONGO=true explicitly.
+  if (
+    /localhost|127\.0\.0\.1/.test(env.MONGODB_URI) &&
+    process.env.ALLOW_LOCAL_MONGO !== 'true'
+  ) {
+    problems.push(
+      'MONGODB_URI points at localhost in production (set ALLOW_LOCAL_MONGO=true if intentional)'
+    );
   }
   if (problems.length) {
     throw new Error(`Unsafe production configuration:\n- ${problems.join('\n- ')}`);

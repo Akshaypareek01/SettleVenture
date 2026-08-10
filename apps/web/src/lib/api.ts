@@ -92,6 +92,12 @@ export interface BankAccount {
   createdAt?: string;
 }
 
+export interface VenturePartner {
+  _id: string;
+  name: string;
+  email: string;
+}
+
 export interface Venture {
   _id: string;
   name: string;
@@ -99,6 +105,7 @@ export interface Venture {
   status: string;
   ventureTypeId: VentureType | string;
   bankAccounts?: BankAccount[];
+  partners?: VenturePartner[];
 }
 
 export interface Category {
@@ -118,7 +125,8 @@ export interface Transaction {
     | 'VENDOR_PAYMENT_OUT'
     | 'EARNING_IN'
     | 'EMI_PERSONAL'
-    | 'EMI_FROM_BANK';
+    | 'EMI_FROM_BANK'
+    | 'PARTNER_TRANSFER';
   amount: number;
   date: string;
   paidFrom?: string;
@@ -129,9 +137,57 @@ export interface Transaction {
   categoryId?: string;
   categoryName?: string;
   beneficiaryPartnerId?: string | { _id: string; name: string; email: string };
+  transferBucket?: 'INVESTMENT' | 'EXPENSE';
   emiPeriod?: string;
   partnerId: { _id: string; name: string; email: string };
   attachments?: { id: string; fileName: string; fileType?: string; downloadUrl: string }[];
+}
+
+export interface FairSharePartnerRow {
+  partnerId: string;
+  name: string;
+  raw: number;
+  paidOut: number;
+  received: number;
+  effective: number;
+  fairShare: number;
+  net: number;
+  status: string;
+}
+
+export interface SuggestedPayment {
+  fromPartnerId: string;
+  fromName: string;
+  toPartnerId: string;
+  toName: string;
+  amount: number;
+}
+
+export interface FairShareTransferRow {
+  id: string;
+  amount: number;
+  date: string;
+  remark?: string;
+  paidFrom?: string;
+  fromPartnerId: string;
+  fromName: string;
+  toPartnerId: string;
+  toName: string;
+  transferBucket: 'INVESTMENT' | 'EXPENSE';
+}
+
+export interface FairShareBucket {
+  total: number;
+  fairShare: number;
+  partnerCount: number;
+  byPartner: FairSharePartnerRow[];
+  suggestedPayments: SuggestedPayment[];
+  transfers: FairShareTransferRow[];
+}
+
+export interface VentureFairShare {
+  investment: FairShareBucket;
+  expenses: FairShareBucket;
 }
 
 export interface PartnerSummaryRow {

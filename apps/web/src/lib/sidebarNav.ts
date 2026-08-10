@@ -9,6 +9,7 @@ import {
   Receipt,
   FolderOpen,
   PieChart,
+  Scale,
   Users,
   Tags,
   FolderKanban,
@@ -53,6 +54,7 @@ export function projectNavLinks(projectId: string): SidebarLink[] {
     { to: `${base}/gst`, label: 'GST', icon: Receipt },
     { to: `${base}/documents`, label: 'Documents', icon: FolderOpen },
     { to: `${base}/analysis`, label: 'Analysis', icon: PieChart },
+    { to: `${base}/fair-share`, label: 'Fair Share', icon: Scale },
   ];
 }
 

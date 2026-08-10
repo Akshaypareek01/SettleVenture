@@ -65,6 +65,14 @@ export function getEntryImpact(type: TransactionType): EntryImpact {
       fairShare: false,
       summary: 'Project bank pays a partner’s EMI — bank/pool down, EMI board up',
     },
+    PARTNER_TRANSFER: {
+      pool: 'none',
+      bank: 'none',
+      contributed: 'none',
+      emiBoard: 'none',
+      fairShare: true,
+      summary: 'Personal settlement between partners — adjusts fair share only, no bank movement',
+    },
   };
   return map[type];
 }
@@ -94,6 +102,11 @@ export function paidFromLabel(type: TransactionType): { label: string; placehold
       return {
         label: 'Paid from (cash / personal UPI)',
         placeholder: 'Cash, personal UPI...',
+      };
+    case 'PARTNER_TRANSFER':
+      return {
+        label: 'Paid from (cash / personal UPI)',
+        placeholder: 'Cash, personal UPI, bank transfer...',
       };
     default:
       return { label: 'Source / reference', placeholder: '...' };

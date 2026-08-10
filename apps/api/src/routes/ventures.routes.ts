@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import { Venture, VentureType, PartnerVenture, Category } from '../models/index.js';
 import { AuthRequest, requireAuth, requireVentureAccess } from '../middleware/auth.middleware.js';
 import { computeVentureSummary } from '../services/settlement.service.js';
+import { computeVentureFairShare } from '../services/fairShare.service.js';
 import { computeVentureEmiSummary } from '../services/emi.service.js';
 import { computeGstSummary } from '../services/invoice.service.js';
 import {
@@ -64,6 +65,18 @@ router.get('/:id/summary', requireVentureAccess, async (req: AuthRequest, res: R
   const summary = await computeVentureSummary(String(req.params.id));
   res.json(summary);
 });
+
+/**
+ * GET /api/ventures/:id/fair-share — investment & expense fair-share with transfers.
+ */
+router.get(
+  '/:id/fair-share',
+  requireVentureAccess,
+  async (req: AuthRequest, res: Response): Promise<void> => {
+    const fairShare = await computeVentureFairShare(String(req.params.id));
+    res.json(fairShare);
+  }
+);
 
 /**
  * GET /api/ventures/:id/partners/:partnerId/analytics — partner-level project analytics.

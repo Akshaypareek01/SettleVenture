@@ -9,6 +9,7 @@ import { parsePagination, paginatedResult, searchRegex } from '../utils/paginati
 import {
   assertBankAccountRequirement,
   assertEmiBeneficiary,
+  assertPartnerTransfer,
   createTxnSchema,
   resolveBankAccount,
   resolveCategoryFields,
@@ -185,6 +186,8 @@ router.post('/', requireVentureAccess, async (req: AuthRequest, res: Response): 
 
     let beneficiaryPartnerId: mongoose.Types.ObjectId | undefined;
     let emiPeriod: string | undefined;
+    let transferBucket: 'INVESTMENT' | 'EXPENSE' | undefined;
+    let paidTo = data.paidTo?.trim() || undefined;
 
     if (data.type === 'EMI_PERSONAL' || data.type === 'EMI_FROM_BANK') {
       const beneficiaryId =
@@ -196,6 +199,21 @@ router.post('/', requireVentureAccess, async (req: AuthRequest, res: Response): 
       }
       beneficiaryPartnerId = new mongoose.Types.ObjectId(beneficiaryId);
       emiPeriod = data.emiPeriod;
+    }
+
+    if (data.type === 'PARTNER_TRANSFER') {
+      const transferCheck = await assertPartnerTransfer(
+        ventureId,
+        String(partnerId),
+        data.beneficiaryPartnerId!
+      );
+      if (!transferCheck.ok) {
+        res.status(400).json({ error: transferCheck.error });
+        return;
+      }
+      beneficiaryPartnerId = new mongoose.Types.ObjectId(data.beneficiaryPartnerId!);
+      transferBucket = data.transferBucket;
+      if (!paidTo) paidTo = transferCheck.receiverName;
     }
 
     // Atomic write: serialize per-account (guard bump), re-check balance inside the
@@ -230,11 +248,12 @@ router.post('/', requireVentureAccess, async (req: AuthRequest, res: Response): 
               amount: mongoose.Types.Decimal128.fromString(toDecimalString(data.amount)),
               date: new Date(data.date),
               paidFrom: data.paidFrom?.trim() || undefined,
-              paidTo: data.paidTo?.trim() || undefined,
+              paidTo,
               remark: data.remark?.trim() || undefined,
               ...bankFields,
               ...categoryResult.fields,
               beneficiaryPartnerId,
+              transferBucket,
               emiPeriod,
               createdById: req.user!._id,
             },
