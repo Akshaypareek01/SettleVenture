@@ -27,7 +27,14 @@ export const createTxnSchema = z
     bankAccountId: z.string().optional(),
     categoryId: z.string().optional(),
     beneficiaryPartnerId: z.string().optional(),
-    transferBucket: z.enum(['INVESTMENT', 'EXPENSE']).optional(),
+    transferBucket: z.enum(['INVESTMENT', 'EXPENSE', 'EMI', 'COMBINED']).optional(),
+    transferAllocations: z
+      .object({
+        investment: z.number().nonnegative(),
+        expenses: z.number().nonnegative(),
+        emi: z.number().nonnegative(),
+      })
+      .optional(),
     emiPeriod: z.string().optional(),
   })
   .superRefine((data, ctx) => {
@@ -66,7 +73,7 @@ export const createTxnSchema = z
       if (!data.transferBucket) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: 'Transfer bucket (Investment or Expense) is required',
+          message: 'Transfer bucket is required',
           path: ['transferBucket'],
         });
       }

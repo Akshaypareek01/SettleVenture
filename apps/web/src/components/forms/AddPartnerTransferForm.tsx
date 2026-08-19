@@ -1,10 +1,23 @@
-import { FormEvent, useEffect, useRef, useState } from 'react';
-import { api, apiUpload, Transaction, Venture, VenturePartner } from '../../lib/api';
+import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  api,
+  apiUpload,
+  Transaction,
+  Venture,
+  VentureFairShare,
+  VenturePartner,
+} from '../../lib/api';
 import { formatINR } from '../../lib/format';
 import { paidFromLabel } from '../../lib/entryImpact';
-import type { TransferBucket } from '../../lib/transactionTypes';
+import {
+  bucketShortfalls,
+  maxPairTransfer,
+  partnerBucketNets,
+  splitTransferAmount,
+} from '../../lib/fairShareAlloc';
 import { useAuth } from '../../contexts/AuthContext';
 import ProofUploadField, { validateProofFile } from './ProofUploadField';
+import TransferSplitPreview from './TransferSplitPreview';
 
 interface AddPartnerTransferFormProps {
   ventureId: string;
@@ -15,12 +28,12 @@ interface AddPartnerTransferFormProps {
     fromPartnerId?: string;
     toPartnerId?: string;
     amount?: number;
-    transferBucket?: TransferBucket;
   };
 }
 
 /**
  * Form to log a personal partner→partner fair-share settlement transfer.
+ * One entry auto-splits across remaining investment, expenses, and EMI.
  */
 export default function AddPartnerTransferForm({
   ventureId,
@@ -31,9 +44,7 @@ export default function AddPartnerTransferForm({
   const { user } = useAuth();
   const isAdmin = user?.role === 'admin';
   const [partners, setPartners] = useState<VenturePartner[]>([]);
-  const [transferBucket, setTransferBucket] = useState<TransferBucket>(
-    preset?.transferBucket ?? 'INVESTMENT'
-  );
+  const [board, setBoard] = useState<VentureFairShare | null>(null);
   const [fromPartnerId, setFromPartnerId] = useState(
     preset?.fromPartnerId ?? user?.id ?? ''
   );
@@ -53,6 +64,19 @@ export default function AddPartnerTransferForm({
   const sourceField = paidFromLabel('PARTNER_TRANSFER');
   const amountNum = amount === '' ? NaN : parseFloat(amount);
 
+  const split = useMemo(() => {
+    if (!board || !fromPartnerId || !toPartnerId || fromPartnerId === toPartnerId) {
+      return { maxAmount: 0, allocations: { investment: 0, expenses: 0, emi: 0 } };
+    }
+    const payerNets = partnerBucketNets(board, fromPartnerId);
+    const receiverNets = partnerBucketNets(board, toPartnerId);
+    const maxAmount = maxPairTransfer(payerNets, receiverNets);
+    const allocations = Number.isFinite(amountNum) && amountNum > 0
+      ? splitTransferAmount(amountNum, bucketShortfalls(payerNets))
+      : { investment: 0, expenses: 0, emi: 0 };
+    return { maxAmount, allocations };
+  }, [board, fromPartnerId, toPartnerId, amountNum]);
+
   useEffect(() => {
     return () => {
       if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
@@ -63,9 +87,13 @@ export default function AddPartnerTransferForm({
     let cancelled = false;
     (async () => {
       try {
-        const venture = await api<Venture>(`/ventures/${ventureId}`);
+        const [venture, fairShare] = await Promise.all([
+          api<Venture>(`/ventures/${ventureId}`),
+          api<VentureFairShare>(`/ventures/${ventureId}/fair-share`),
+        ]);
         if (cancelled) return;
         setPartners(venture.partners ?? []);
+        setBoard(fairShare);
         if (!isAdmin && user?.id) {
           setFromPartnerId(user.id);
         } else if (!fromPartnerId && user?.id) {
@@ -79,6 +107,12 @@ export default function AddPartnerTransferForm({
       cancelled = true;
     };
   }, [ventureId, isAdmin, user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!board || !fromPartnerId || !toPartnerId || fromPartnerId === toPartnerId) return;
+    const next = split.maxAmount > 0.01 ? String(split.maxAmount) : '';
+    setAmount(next);
+  }, [board, fromPartnerId, toPartnerId, split.maxAmount]);
 
   /**
    * Converts YYYY-MM-DD to ISO datetime for the API.
@@ -121,7 +155,7 @@ export default function AddPartnerTransferForm({
   };
 
   /**
-   * Uploads proof and creates the PARTNER_TRANSFER entry.
+   * Uploads proof and creates the combined PARTNER_TRANSFER entry.
    * @param e - Form submit event
    */
   const handleSubmit = async (e: FormEvent) => {
@@ -148,6 +182,14 @@ export default function AddPartnerTransferForm({
       setError('Payer and receiver must be different partners');
       return;
     }
+    if (split.maxAmount <= 0.01) {
+      setError('No remaining fair-share balance between these partners');
+      return;
+    }
+    if (amountNum - split.maxAmount > 0.01) {
+      setError(`Amount exceeds remaining ${formatINR(split.maxAmount)} between these partners`);
+      return;
+    }
     if (!paidFrom.trim()) {
       setError('Paid from is required');
       return;
@@ -172,7 +214,8 @@ export default function AddPartnerTransferForm({
         remark: remark.trim(),
         attachmentIds: [uploaded.id],
         beneficiaryPartnerId: toPartnerId,
-        transferBucket,
+        transferBucket: 'COMBINED',
+        transferAllocations: split.allocations,
       };
       if (isAdmin) body.partnerId = fromPartnerId;
 
@@ -217,7 +260,8 @@ export default function AddPartnerTransferForm({
       <div>
         <h3 className="font-semibold text-lg mb-1">Log partner transfer</h3>
         <p className="text-sm text-muted">
-          Personal money from one partner to another — adjusts fair share only (no project bank).
+          Personal money from one partner to another. One entry clears remaining investment,
+          direct expenses, and EMI (no project bank movement).
         </p>
       </div>
 
@@ -229,23 +273,6 @@ export default function AddPartnerTransferForm({
           {error}
         </div>
       )}
-
-      <div>
-        <label htmlFor="transferBucket" className="block text-sm font-medium mb-2">
-          Applies to <span className="text-red-400">*</span>
-        </label>
-        <select
-          id="transferBucket"
-          value={transferBucket}
-          onChange={(e) => setTransferBucket(e.target.value as TransferBucket)}
-          className="input-field"
-          required
-          aria-label="Fair share bucket"
-        >
-          <option value="INVESTMENT">Partner Investment</option>
-          <option value="EXPENSE">Direct Expense</option>
-        </select>
-      </div>
 
       {isAdmin ? (
         <div>
@@ -299,6 +326,14 @@ export default function AddPartnerTransferForm({
         </select>
       </div>
 
+      {fromPartnerId && toPartnerId && fromPartnerId !== toPartnerId && (
+        <TransferSplitPreview
+          maxAmount={split.maxAmount}
+          allocations={split.allocations}
+          amount={amountNum}
+        />
+      )}
+
       <div>
         <label htmlFor="transferAmount" className="block text-sm font-medium mb-2">
           Amount <span className="text-red-400">*</span>
@@ -308,6 +343,7 @@ export default function AddPartnerTransferForm({
           type="number"
           min="0.01"
           step="0.01"
+          max={split.maxAmount > 0 ? split.maxAmount : undefined}
           value={amount}
           onChange={(e) => setAmount(e.target.value)}
           className="input-field"
@@ -356,7 +392,7 @@ export default function AddPartnerTransferForm({
           value={remark}
           onChange={(e) => setRemark(e.target.value)}
           className="input-field min-h-[88px]"
-          placeholder="e.g. Settling investment shortfall for March"
+          placeholder="e.g. Settling remaining fair share"
           required
           aria-label="Reason for transfer"
         />

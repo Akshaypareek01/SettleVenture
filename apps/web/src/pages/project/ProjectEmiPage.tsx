@@ -10,7 +10,7 @@ import { useAuth } from '../../contexts/AuthContext';
 type EmiFormMode = null | { type: TransactionType; beneficiaryId?: string };
 
 /**
- * Project EMI / loans board with personal and bank payment flows.
+ * Project EMI board with personal and bank payment flows.
  */
 export default function ProjectEmiPage() {
   const { ventureId, refresh, isClosed } = useOutletContext<ProjectOutletContext>();
@@ -73,18 +73,16 @@ export default function ProjectEmiPage() {
     <section aria-labelledby="emi-heading" className="space-y-6">
       <div>
         <h2 id="emi-heading" className="text-xl font-semibold">
-          EMI / Loans
+          EMI
         </h2>
         <p className="text-sm text-muted mt-1">
-          Remaining = loan − EMI paid. EMI does not affect fair-share settlement.
+          EMI entries and paid totals. EMI does not affect fair-share settlement.
         </p>
       </div>
 
       {board && (
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-          <Kpi label="Total loan" value={formatINR(board.totalLoan)} />
+        <div className="grid grid-cols-2 gap-3">
           <Kpi label="Total paid" value={formatINR(board.totalPaid)} />
-          <Kpi label="Remaining" value={formatINR(board.totalRemaining)} />
           <Kpi
             label="From bank"
             value={formatINR(board.totalBankPaid)}
@@ -119,7 +117,7 @@ export default function ProjectEmiPage() {
         <p className="text-muted animate-pulse">Loading EMI board...</p>
       ) : !board || board.partners.length === 0 ? (
         <div className="card text-sm text-muted">
-          No partners assigned yet. Admin can set loan + monthly EMI on the Assign Partners tab.
+          No partners assigned yet. Admin can enable monthly EMI on the Assign Partners tab.
         </div>
       ) : (
         <ul className="space-y-3" aria-label="Partner EMI board">
@@ -166,7 +164,7 @@ interface EmiPartnerCardProps {
   onPayFromBank: () => void;
 }
 
-/** One partner’s loan / EMI status card. */
+/** One partner’s EMI status card. */
 function EmiPartnerCard({
   partner,
   isSelf,
@@ -185,7 +183,7 @@ function EmiPartnerCard({
           <p className="text-xs text-muted mt-1">
             {partner.isEmiActive ? (
               <>
-                Loan {formatINR(partner.loanAmount)} · Monthly {formatINR(partner.monthlyEmi)}
+                Monthly {formatINR(partner.monthlyEmi)}
                 {partner.tenureMonths ? ` · ${partner.tenureMonths} mo` : ''}
               </>
             ) : (
@@ -207,14 +205,10 @@ function EmiPartnerCard({
         )}
       </div>
       {partner.isEmiActive && (
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-sm">
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-sm">
           <div>
             <p className="text-xs text-muted">Paid</p>
             <p className="font-medium">{formatINR(partner.paidAmount)}</p>
-          </div>
-          <div>
-            <p className="text-xs text-muted">Remaining</p>
-            <p className="font-medium">{formatINR(partner.remaining)}</p>
           </div>
           <div>
             <p className="text-xs text-muted">Months paid</p>

@@ -59,10 +59,9 @@ export default function ProjectAnalysisTab({
             {formatINR(emi?.totalPaid ?? 0)}
           </p>
           <p className="text-xs text-muted mt-1">
-            Remaining {formatINR(emi?.totalRemaining ?? 0)}
             {emi
-              ? ` · Bank ${formatINR(emi.totalBankPaid)} / Personal ${formatINR(emi.totalPersonalPaid)}`
-              : ''}
+              ? `Bank ${formatINR(emi.totalBankPaid)} / Personal ${formatINR(emi.totalPersonalPaid)}`
+              : 'No EMI entries yet'}
           </p>
         </div>
       </div>

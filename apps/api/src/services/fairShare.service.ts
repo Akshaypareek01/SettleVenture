@@ -1,9 +1,13 @@
 import { Types } from 'mongoose';
 import { Transaction, PartnerVenture } from '../models/index.js';
+import type { TransferBucket } from '../models/Transaction.model.js';
 import { toNumber } from '../utils/decimal.js';
+import {
+  roundMoney,
+  type TransferAllocations,
+} from './fairShareAlloc.js';
 
 export type FairShareStatus = 'owed_by_group' | 'owes_group' | 'settled';
-export type TransferBucket = 'INVESTMENT' | 'EXPENSE';
 
 export interface FairSharePartnerRow {
   partnerId: string;
@@ -36,6 +40,7 @@ export interface FairShareTransferRow {
   toPartnerId: string;
   toName: string;
   transferBucket: TransferBucket;
+  allocations?: TransferAllocations;
 }
 
 export interface FairShareBucket {
@@ -47,18 +52,30 @@ export interface FairShareBucket {
   transfers: FairShareTransferRow[];
 }
 
+export interface CombinedFairShare {
+  byPartner: { partnerId: string; name: string; net: number; status: FairShareStatus }[];
+  suggestedPayments: SuggestedPayment[];
+  totalRemaining: number;
+}
+
 export interface VentureFairShare {
   investment: FairShareBucket;
   expenses: FairShareBucket;
+  emi: FairShareBucket;
+  combined: CombinedFairShare;
 }
 
-/**
- * Rounds a money amount to 2 decimal places.
- * @param n - Amount
- */
-function roundMoney(n: number): number {
-  return Math.round(n * 100) / 100;
-}
+type BucketAgg = {
+  _id: { partnerId: Types.ObjectId; bucket: TransferBucket };
+  total: Types.Decimal128;
+};
+
+type CombinedAllocAgg = {
+  _id: Types.ObjectId;
+  investment: Types.Decimal128;
+  expenses: Types.Decimal128;
+  emi: Types.Decimal128;
+};
 
 /**
  * Builds status from net balance vs fair share.
@@ -108,7 +125,7 @@ export function suggestPairwisePayments(
 }
 
 /**
- * Builds one fair-share bucket (investment or expenses) for assigned partners.
+ * Builds one fair-share bucket for assigned partners.
  * @param params - Raw totals, transfer adjustments, and transfer history
  */
 function buildBucket(params: {
@@ -161,27 +178,145 @@ function buildBucket(params: {
 }
 
 /**
- * Computes investment and expense fair-share buckets with partner transfers applied.
+ * Applies single-bucket transfer aggregation rows into the three maps.
+ * @param rows - Grouped transfer totals
+ * @param invMap - Investment map to mutate
+ * @param expMap - Expense map to mutate
+ * @param emiMap - EMI map to mutate
+ */
+function applyLegacyTransferAgg(
+  rows: BucketAgg[],
+  invMap: Map<string, number>,
+  expMap: Map<string, number>,
+  emiMap: Map<string, number>
+): void {
+  for (const row of rows) {
+    if (!row._id?.partnerId) continue;
+    const id = String(row._id.partnerId);
+    const amount = toNumber(row.total);
+    if (row._id.bucket === 'INVESTMENT') {
+      invMap.set(id, (invMap.get(id) ?? 0) + amount);
+    } else if (row._id.bucket === 'EXPENSE') {
+      expMap.set(id, (expMap.get(id) ?? 0) + amount);
+    } else if (row._id.bucket === 'EMI') {
+      emiMap.set(id, (emiMap.get(id) ?? 0) + amount);
+    }
+  }
+}
+
+/**
+ * Applies COMBINED transfer allocation totals into the three maps.
+ * @param rows - Grouped combined allocation totals
+ * @param invMap - Investment map to mutate
+ * @param expMap - Expense map to mutate
+ * @param emiMap - EMI map to mutate
+ */
+function applyCombinedAllocAgg(
+  rows: CombinedAllocAgg[],
+  invMap: Map<string, number>,
+  expMap: Map<string, number>,
+  emiMap: Map<string, number>
+): void {
+  for (const row of rows) {
+    if (!row._id) continue;
+    const id = String(row._id);
+    invMap.set(id, (invMap.get(id) ?? 0) + toNumber(row.investment));
+    expMap.set(id, (expMap.get(id) ?? 0) + toNumber(row.expenses));
+    emiMap.set(id, (emiMap.get(id) ?? 0) + toNumber(row.emi));
+  }
+}
+
+/**
+ * Filters transfers for one bucket, using COMBINED allocation slices.
+ * @param all - All mapped transfers
+ * @param bucket - Target bucket
+ */
+function transfersForBucket(
+  all: FairShareTransferRow[],
+  bucket: 'INVESTMENT' | 'EXPENSE' | 'EMI'
+): FairShareTransferRow[] {
+  return all.flatMap((t) => {
+    if (t.transferBucket === bucket) return [t];
+    if (t.transferBucket !== 'COMBINED' || !t.allocations) return [];
+    const slice =
+      bucket === 'INVESTMENT'
+        ? t.allocations.investment
+        : bucket === 'EXPENSE'
+          ? t.allocations.expenses
+          : t.allocations.emi;
+    if (slice <= 0.01) return [];
+    return [{ ...t, amount: slice }];
+  });
+}
+
+/**
+ * Builds combined nets (investment + expenses + EMI) and suggested pays.
+ * @param partners - Assigned partners
+ * @param investment - Investment bucket
+ * @param expenses - Expense bucket
+ * @param emi - EMI bucket
+ */
+function buildCombined(
+  partners: { partnerId: string; name: string }[],
+  investment: FairShareBucket,
+  expenses: FairShareBucket,
+  emi: FairShareBucket
+): CombinedFairShare {
+  const byPartner = partners.map((p) => {
+    const inv = investment.byPartner.find((r) => r.partnerId === p.partnerId)?.net ?? 0;
+    const exp = expenses.byPartner.find((r) => r.partnerId === p.partnerId)?.net ?? 0;
+    const emiNet = emi.byPartner.find((r) => r.partnerId === p.partnerId)?.net ?? 0;
+    const net = roundMoney(inv + exp + emiNet);
+    return { partnerId: p.partnerId, name: p.name, net, status: statusFromNet(net) };
+  });
+  const suggestedPayments = suggestPairwisePayments(byPartner);
+  const totalRemaining = roundMoney(
+    suggestedPayments.reduce((sum, pay) => sum + pay.amount, 0)
+  );
+  return { byPartner, suggestedPayments, totalRemaining };
+}
+
+const combinedAllocGroup = {
+  investment: { $sum: { $ifNull: ['$transferAllocations.investment', 0] } },
+  expenses: { $sum: { $ifNull: ['$transferAllocations.expenses', 0] } },
+  emi: { $sum: { $ifNull: ['$transferAllocations.emi', 0] } },
+};
+
+/**
+ * Computes investment, expense, and EMI fair-share buckets with transfers applied.
  * @param ventureId - Venture ObjectId string
  */
 export async function computeVentureFairShare(ventureId: string): Promise<VentureFairShare> {
   const vid = new Types.ObjectId(ventureId);
 
-  type BucketAgg = { _id: { partnerId: Types.ObjectId; bucket: TransferBucket }; total: Types.Decimal128 };
-
-  const transferMatch = {
+  const legacyTransferMatch = {
     ventureId: vid,
     isDeleted: false,
     type: 'PARTNER_TRANSFER' as const,
-    transferBucket: { $in: ['INVESTMENT', 'EXPENSE'] },
+    transferBucket: { $in: ['INVESTMENT', 'EXPENSE', 'EMI'] },
+  };
+  const combinedMatch = {
+    ventureId: vid,
+    isDeleted: false,
+    type: 'PARTNER_TRANSFER' as const,
+    transferBucket: 'COMBINED' as const,
   };
 
-  const [assignments, rawAgg, paidOutAgg, receivedAgg, transferDocs] = await Promise.all([
+  const [
+    assignments,
+    rawAgg,
+    paidOutAgg,
+    receivedAgg,
+    combinedPaidAgg,
+    combinedRecvAgg,
+    transferDocs,
+  ] = await Promise.all([
     PartnerVenture.find({ ventureId }).populate('partnerId', 'name').lean(),
     Transaction.aggregate<{
       _id: Types.ObjectId;
       investment: Types.Decimal128;
       expenses: Types.Decimal128;
+      emi: Types.Decimal128;
     }>([
       { $match: { ventureId: vid, isDeleted: false } },
       {
@@ -193,11 +328,14 @@ export async function computeVentureFairShare(ventureId: string): Promise<Ventur
           expenses: {
             $sum: { $cond: [{ $eq: ['$type', 'EXPENSE'] }, '$amount', 0] },
           },
+          emi: {
+            $sum: { $cond: [{ $eq: ['$type', 'EMI_PERSONAL'] }, '$amount', 0] },
+          },
         },
       },
     ]),
     Transaction.aggregate<BucketAgg>([
-      { $match: transferMatch },
+      { $match: legacyTransferMatch },
       {
         $group: {
           _id: { partnerId: '$partnerId', bucket: '$transferBucket' },
@@ -206,13 +344,21 @@ export async function computeVentureFairShare(ventureId: string): Promise<Ventur
       },
     ]),
     Transaction.aggregate<BucketAgg>([
-      { $match: { ...transferMatch, beneficiaryPartnerId: { $ne: null } } },
+      { $match: { ...legacyTransferMatch, beneficiaryPartnerId: { $ne: null } } },
       {
         $group: {
           _id: { partnerId: '$beneficiaryPartnerId', bucket: '$transferBucket' },
           total: { $sum: '$amount' },
         },
       },
+    ]),
+    Transaction.aggregate<CombinedAllocAgg>([
+      { $match: combinedMatch },
+      { $group: { _id: '$partnerId', ...combinedAllocGroup } },
+    ]),
+    Transaction.aggregate<CombinedAllocAgg>([
+      { $match: { ...combinedMatch, beneficiaryPartnerId: { $ne: null } } },
+      { $group: { _id: '$beneficiaryPartnerId', ...combinedAllocGroup } },
     ]),
     Transaction.find({
       ventureId: vid,
@@ -236,46 +382,37 @@ export async function computeVentureFairShare(ventureId: string): Promise<Ventur
   const partnerCount = partners.length;
   const invRaw = new Map<string, number>();
   const expRaw = new Map<string, number>();
+  const emiRaw = new Map<string, number>();
   for (const row of rawAgg) {
     const id = String(row._id);
     invRaw.set(id, toNumber(row.investment));
     expRaw.set(id, toNumber(row.expenses));
-  }
-
-  /**
-   * Applies transfer aggregation rows into investment/expense maps.
-   * @param rows - Grouped transfer totals
-   * @param invMap - Investment map to mutate
-   * @param expMap - Expense map to mutate
-   */
-  function applyTransferAgg(
-    rows: BucketAgg[],
-    invMap: Map<string, number>,
-    expMap: Map<string, number>
-  ): void {
-    for (const row of rows) {
-      if (!row._id?.partnerId) continue;
-      const id = String(row._id.partnerId);
-      const amount = toNumber(row.total);
-      if (row._id.bucket === 'INVESTMENT') {
-        invMap.set(id, (invMap.get(id) ?? 0) + amount);
-      } else {
-        expMap.set(id, (expMap.get(id) ?? 0) + amount);
-      }
-    }
+    emiRaw.set(id, toNumber(row.emi));
   }
 
   const invPaid = new Map<string, number>();
   const invRecv = new Map<string, number>();
   const expPaid = new Map<string, number>();
   const expRecv = new Map<string, number>();
-  applyTransferAgg(paidOutAgg, invPaid, expPaid);
-  applyTransferAgg(receivedAgg, invRecv, expRecv);
+  const emiPaid = new Map<string, number>();
+  const emiRecv = new Map<string, number>();
+  applyLegacyTransferAgg(paidOutAgg, invPaid, expPaid, emiPaid);
+  applyLegacyTransferAgg(receivedAgg, invRecv, expRecv, emiRecv);
+  applyCombinedAllocAgg(combinedPaidAgg, invPaid, expPaid, emiPaid);
+  applyCombinedAllocAgg(combinedRecvAgg, invRecv, expRecv, emiRecv);
 
   const mapTransfer = (t: (typeof transferDocs)[number]): FairShareTransferRow | null => {
     const from = t.partnerId as unknown as { _id: Types.ObjectId; name: string };
     const to = t.beneficiaryPartnerId as unknown as { _id: Types.ObjectId; name: string } | null;
     if (!to?._id || !t.transferBucket) return null;
+    const rawAlloc = t.transferAllocations;
+    const allocations: TransferAllocations | undefined = rawAlloc
+      ? {
+          investment: toNumber(rawAlloc.investment),
+          expenses: toNumber(rawAlloc.expenses),
+          emi: toNumber(rawAlloc.emi),
+        }
+      : undefined;
     return {
       id: String(t._id),
       amount: toNumber(t.amount),
@@ -287,6 +424,7 @@ export async function computeVentureFairShare(ventureId: string): Promise<Ventur
       toPartnerId: String(to._id),
       toName: to.name,
       transferBucket: t.transferBucket as TransferBucket,
+      allocations,
     };
   };
 
@@ -294,22 +432,35 @@ export async function computeVentureFairShare(ventureId: string): Promise<Ventur
     .map(mapTransfer)
     .filter((t): t is FairShareTransferRow => t !== null);
 
+  const investment = buildBucket({
+    partnerCount,
+    partners,
+    rawByPartner: invRaw,
+    paidOutByPartner: invPaid,
+    receivedByPartner: invRecv,
+    transfers: transfersForBucket(allTransfers, 'INVESTMENT'),
+  });
+  const expenses = buildBucket({
+    partnerCount,
+    partners,
+    rawByPartner: expRaw,
+    paidOutByPartner: expPaid,
+    receivedByPartner: expRecv,
+    transfers: transfersForBucket(allTransfers, 'EXPENSE'),
+  });
+  const emi = buildBucket({
+    partnerCount,
+    partners,
+    rawByPartner: emiRaw,
+    paidOutByPartner: emiPaid,
+    receivedByPartner: emiRecv,
+    transfers: transfersForBucket(allTransfers, 'EMI'),
+  });
+
   return {
-    investment: buildBucket({
-      partnerCount,
-      partners,
-      rawByPartner: invRaw,
-      paidOutByPartner: invPaid,
-      receivedByPartner: invRecv,
-      transfers: allTransfers.filter((t) => t.transferBucket === 'INVESTMENT'),
-    }),
-    expenses: buildBucket({
-      partnerCount,
-      partners,
-      rawByPartner: expRaw,
-      paidOutByPartner: expPaid,
-      receivedByPartner: expRecv,
-      transfers: allTransfers.filter((t) => t.transferBucket === 'EXPENSE'),
-    }),
+    investment,
+    expenses,
+    emi,
+    combined: buildCombined(partners, investment, expenses, emi),
   };
 }

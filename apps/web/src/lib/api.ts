@@ -137,7 +137,12 @@ export interface Transaction {
   categoryId?: string;
   categoryName?: string;
   beneficiaryPartnerId?: string | { _id: string; name: string; email: string };
-  transferBucket?: 'INVESTMENT' | 'EXPENSE';
+  transferBucket?: 'INVESTMENT' | 'EXPENSE' | 'EMI' | 'COMBINED';
+  transferAllocations?: {
+    investment: number;
+    expenses: number;
+    emi: number;
+  };
   emiPeriod?: string;
   partnerId: { _id: string; name: string; email: string };
   attachments?: { id: string; fileName: string; fileType?: string; downloadUrl: string }[];
@@ -173,7 +178,12 @@ export interface FairShareTransferRow {
   fromName: string;
   toPartnerId: string;
   toName: string;
-  transferBucket: 'INVESTMENT' | 'EXPENSE';
+  transferBucket: 'INVESTMENT' | 'EXPENSE' | 'EMI' | 'COMBINED';
+  allocations?: {
+    investment: number;
+    expenses: number;
+    emi: number;
+  };
 }
 
 export interface FairShareBucket {
@@ -185,9 +195,17 @@ export interface FairShareBucket {
   transfers: FairShareTransferRow[];
 }
 
+export interface CombinedFairShare {
+  byPartner: { partnerId: string; name: string; net: number; status: string }[];
+  suggestedPayments: SuggestedPayment[];
+  totalRemaining: number;
+}
+
 export interface VentureFairShare {
   investment: FairShareBucket;
   expenses: FairShareBucket;
+  emi: FairShareBucket;
+  combined: CombinedFairShare;
 }
 
 export interface PartnerSummaryRow {

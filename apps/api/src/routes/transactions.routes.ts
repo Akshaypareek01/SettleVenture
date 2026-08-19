@@ -3,7 +3,7 @@ import { z } from 'zod';
 import mongoose from 'mongoose';
 import { Transaction, Attachment, Venture, Partner, PartnerVenture, Invoice } from '../models/index.js';
 import { AuthRequest, requireAuth, requireVentureAccess } from '../middleware/auth.middleware.js';
-import { toDecimalString, toNumber } from '../utils/decimal.js';
+import { toDecimalString, toDecimalStringNonNegative, toNumber } from '../utils/decimal.js';
 import { getDownloadUrl } from '../services/r2.service.js';
 import { parsePagination, paginatedResult, searchRegex } from '../utils/pagination.js';
 import {
@@ -18,6 +18,9 @@ import { assertSufficientBankBalance } from '../utils/bankBalance.js';
 import { assertAttachmentsForCreate } from '../utils/attachments.js';
 import { withTxn } from '../utils/withTxn.js';
 import { AppError } from '../middleware/error.middleware.js';
+import { computeVentureFairShare } from '../services/fairShare.service.js';
+import { resolveCombinedTransfer } from '../services/fairShareAlloc.js';
+import type { TransferBucket } from '../models/Transaction.model.js';
 
 const router = Router({ mergeParams: true });
 
@@ -44,23 +47,35 @@ async function mapTransactions(txns: TransactionLean[]) {
   }
 
   return Promise.all(
-    txns.map(async (t) => ({
-      ...t,
-      amount: toNumber(t.amount),
-      bankAccountId: t.bankAccountId ? String(t.bankAccountId) : undefined,
-      categoryId: t.categoryId ? String(t.categoryId) : undefined,
-      beneficiaryPartnerId: t.beneficiaryPartnerId
-        ? String(t.beneficiaryPartnerId)
-        : undefined,
-      attachments: await Promise.all(
-        (attachMap.get(String(t._id)) ?? []).map(async (a) => ({
-          id: a._id,
-          fileName: a.fileName,
-          fileType: a.fileType,
-          downloadUrl: await getDownloadUrl(a.r2Key, a.publicUrl),
-        }))
-      ),
-    }))
+    txns.map(async (t) => {
+      const rawAlloc = t.transferAllocations as
+        | { investment?: unknown; expenses?: unknown; emi?: unknown }
+        | undefined;
+      return {
+        ...t,
+        amount: toNumber(t.amount),
+        bankAccountId: t.bankAccountId ? String(t.bankAccountId) : undefined,
+        categoryId: t.categoryId ? String(t.categoryId) : undefined,
+        beneficiaryPartnerId: t.beneficiaryPartnerId
+          ? String(t.beneficiaryPartnerId)
+          : undefined,
+        transferAllocations: rawAlloc
+          ? {
+              investment: toNumber(rawAlloc.investment),
+              expenses: toNumber(rawAlloc.expenses),
+              emi: toNumber(rawAlloc.emi),
+            }
+          : undefined,
+        attachments: await Promise.all(
+          (attachMap.get(String(t._id)) ?? []).map(async (a) => ({
+            id: a._id,
+            fileName: a.fileName,
+            fileType: a.fileType,
+            downloadUrl: await getDownloadUrl(a.r2Key, a.publicUrl),
+          }))
+        ),
+      };
+    })
   );
 }
 
@@ -186,7 +201,14 @@ router.post('/', requireVentureAccess, async (req: AuthRequest, res: Response): 
 
     let beneficiaryPartnerId: mongoose.Types.ObjectId | undefined;
     let emiPeriod: string | undefined;
-    let transferBucket: 'INVESTMENT' | 'EXPENSE' | undefined;
+    let transferBucket: TransferBucket | undefined;
+    let transferAllocations:
+      | {
+          investment: mongoose.Types.Decimal128;
+          expenses: mongoose.Types.Decimal128;
+          emi: mongoose.Types.Decimal128;
+        }
+      | undefined;
     let paidTo = data.paidTo?.trim() || undefined;
 
     if (data.type === 'EMI_PERSONAL' || data.type === 'EMI_FROM_BANK') {
@@ -214,6 +236,31 @@ router.post('/', requireVentureAccess, async (req: AuthRequest, res: Response): 
       beneficiaryPartnerId = new mongoose.Types.ObjectId(data.beneficiaryPartnerId!);
       transferBucket = data.transferBucket;
       if (!paidTo) paidTo = transferCheck.receiverName;
+
+      if (transferBucket === 'COMBINED') {
+        const fairShare = await computeVentureFairShare(ventureId);
+        const split = resolveCombinedTransfer(
+          fairShare,
+          String(partnerId),
+          data.beneficiaryPartnerId!,
+          data.amount
+        );
+        if (!split.ok) {
+          res.status(400).json({ error: split.error });
+          return;
+        }
+        transferAllocations = {
+          investment: mongoose.Types.Decimal128.fromString(
+            toDecimalStringNonNegative(split.allocations.investment)
+          ),
+          expenses: mongoose.Types.Decimal128.fromString(
+            toDecimalStringNonNegative(split.allocations.expenses)
+          ),
+          emi: mongoose.Types.Decimal128.fromString(
+            toDecimalStringNonNegative(split.allocations.emi)
+          ),
+        };
+      }
     }
 
     // Atomic write: serialize per-account (guard bump), re-check balance inside the
@@ -254,6 +301,7 @@ router.post('/', requireVentureAccess, async (req: AuthRequest, res: Response): 
               ...categoryResult.fields,
               beneficiaryPartnerId,
               transferBucket,
+              transferAllocations,
               emiPeriod,
               createdById: req.user!._id,
             },

@@ -9,7 +9,13 @@ export type TransactionType =
   | 'EMI_FROM_BANK'
   | 'PARTNER_TRANSFER';
 
-export type TransferBucket = 'INVESTMENT' | 'EXPENSE';
+export type TransferBucket = 'INVESTMENT' | 'EXPENSE' | 'EMI' | 'COMBINED';
+
+export interface TransferAllocations {
+  investment?: Types.Decimal128;
+  expenses?: Types.Decimal128;
+  emi?: Types.Decimal128;
+}
 
 export interface ITransaction extends Document {
   _id: Types.ObjectId;
@@ -28,6 +34,8 @@ export interface ITransaction extends Document {
   beneficiaryPartnerId?: Types.ObjectId;
   /** Fair-share bucket for PARTNER_TRANSFER only */
   transferBucket?: TransferBucket;
+  /** Per-bucket split when transferBucket is COMBINED */
+  transferAllocations?: TransferAllocations;
   emiPeriod?: string;
   createdById: Types.ObjectId;
   isDeleted: boolean;
@@ -66,7 +74,12 @@ const transactionSchema = new Schema<ITransaction>(
     beneficiaryPartnerId: { type: Schema.Types.ObjectId, ref: 'Partner' },
     transferBucket: {
       type: String,
-      enum: ['INVESTMENT', 'EXPENSE'],
+      enum: ['INVESTMENT', 'EXPENSE', 'EMI', 'COMBINED'],
+    },
+    transferAllocations: {
+      investment: { type: Schema.Types.Decimal128 },
+      expenses: { type: Schema.Types.Decimal128 },
+      emi: { type: Schema.Types.Decimal128 },
     },
     emiPeriod: { type: String, trim: true },
     createdById: { type: Schema.Types.ObjectId, ref: 'Partner', required: true },

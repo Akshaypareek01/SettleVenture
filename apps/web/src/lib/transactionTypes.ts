@@ -7,7 +7,7 @@ export type TransactionType =
   | 'EMI_FROM_BANK'
   | 'PARTNER_TRANSFER';
 
-export type TransferBucket = 'INVESTMENT' | 'EXPENSE';
+export type TransferBucket = 'INVESTMENT' | 'EXPENSE' | 'EMI' | 'COMBINED';
 
 export interface EntryTypeOption {
   value: TransactionType;
@@ -72,11 +72,13 @@ export function transactionTypeLabel(type?: string): string {
 
 /**
  * Label for a fair-share transfer bucket.
- * @param bucket - INVESTMENT or EXPENSE
+ * @param bucket - INVESTMENT, EXPENSE, EMI, or COMBINED
  */
 export function transferBucketLabel(bucket?: string): string {
   if (bucket === 'INVESTMENT') return 'Investment';
   if (bucket === 'EXPENSE') return 'Direct Expense';
+  if (bucket === 'EMI') return 'EMI';
+  if (bucket === 'COMBINED') return 'Combined';
   return 'Transfer';
 }
 

@@ -54,8 +54,8 @@ export function getEntryImpact(type: TransactionType): EntryImpact {
       bank: 'none',
       contributed: 'none',
       emiBoard: 'up',
-      fairShare: false,
-      summary: 'You pay EMI from your pocket — EMI board only, not fair share',
+      fairShare: true,
+      summary: 'You pay EMI from your pocket — counts toward EMI fair share',
     },
     EMI_FROM_BANK: {
       pool: 'down',
@@ -63,7 +63,7 @@ export function getEntryImpact(type: TransactionType): EntryImpact {
       contributed: 'none',
       emiBoard: 'up',
       fairShare: false,
-      summary: 'Project bank pays a partner’s EMI — bank/pool down, EMI board up',
+      summary: 'Project bank pays EMI — bank/pool down, EMI board up (not fair share)',
     },
     PARTNER_TRANSFER: {
       pool: 'none',
@@ -71,7 +71,7 @@ export function getEntryImpact(type: TransactionType): EntryImpact {
       contributed: 'none',
       emiBoard: 'none',
       fairShare: true,
-      summary: 'Personal settlement between partners — adjusts fair share only, no bank movement',
+      summary: 'Personal settlement — clears remaining investment, expenses, and EMI',
     },
   };
   return map[type];

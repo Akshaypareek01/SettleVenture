@@ -67,7 +67,7 @@ router.get('/:id/summary', requireVentureAccess, async (req: AuthRequest, res: R
 });
 
 /**
- * GET /api/ventures/:id/fair-share — investment & expense fair-share with transfers.
+ * GET /api/ventures/:id/fair-share — investment, expense, and EMI fair-share with transfers.
  */
 router.get(
   '/:id/fair-share',

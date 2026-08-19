@@ -4,12 +4,12 @@ import type { ProjectOutletContext } from '../../components/project/ProjectLayou
 import ProjectFairShareOverview from '../../components/project/ProjectFairShareOverview';
 import ProjectTransactionsTab from '../../components/project/ProjectTransactionsTab';
 import AddPartnerTransferForm from '../../components/forms/AddPartnerTransferForm';
-import { api, VentureFairShare } from '../../lib/api';
+import { api, SuggestedPayment, VentureFairShare } from '../../lib/api';
 
 type FairShareSubTab = 'overview' | 'transfer' | 'history';
 
 /**
- * Project fair-share module — split investment/expense nets + partner transfers.
+ * Project fair-share module — investment, expenses, EMI, and partner transfers.
  */
 export default function ProjectFairSharePage() {
   const { ventureId, refresh, isClosed } = useOutletContext<ProjectOutletContext>();
@@ -18,6 +18,11 @@ export default function ProjectFairSharePage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [refreshKey, setRefreshKey] = useState(0);
+  const [transferPreset, setTransferPreset] = useState<{
+    fromPartnerId?: string;
+    toPartnerId?: string;
+    amount?: number;
+  } | null>(null);
 
   /**
    * Loads fair-share buckets from the API.
@@ -46,8 +51,23 @@ export default function ProjectFairSharePage() {
    */
   const handleTransferSuccess = async () => {
     await refresh();
+    setTransferPreset(null);
     setRefreshKey((k) => k + 1);
     setSubTab('history');
+  };
+
+  /**
+   * Opens the transfer form prefilled from a suggested payment.
+   * @param pay - Combined suggested A→B payment
+   */
+  const handleSettle = (pay: SuggestedPayment) => {
+    if (isClosed) return;
+    setTransferPreset({
+      fromPartnerId: pay.fromPartnerId,
+      toPartnerId: pay.toPartnerId,
+      amount: pay.amount,
+    });
+    setSubTab('transfer');
   };
 
   const subTabs: { key: FairShareSubTab; label: string }[] = [
@@ -61,8 +81,8 @@ export default function ProjectFairSharePage() {
       <div className="mb-6">
         <h2 className="text-xl font-semibold">Fair Share</h2>
         <p className="text-sm text-muted mt-1">
-          Equal share for partner investment and direct expenses. Log personal transfers when one
-          partner pays another to settle.
+          Equal share of partner investment, direct expenses, and personal EMI. One transfer
+          clears remaining balances between two partners.
         </p>
       </div>
 
@@ -93,14 +113,21 @@ export default function ProjectFairSharePage() {
               {error}
             </p>
           )}
-          {!loading && !error && data && <ProjectFairShareOverview data={data} />}
+          {!loading && !error && data && (
+            <ProjectFairShareOverview
+              data={data}
+              onSettle={isClosed ? undefined : handleSettle}
+            />
+          )}
         </>
       )}
 
       {subTab === 'transfer' && !isClosed && (
         <AddPartnerTransferForm
+          key={`${transferPreset?.fromPartnerId ?? ''}-${transferPreset?.toPartnerId ?? ''}-${transferPreset?.amount ?? ''}`}
           ventureId={ventureId}
           readOnly={isClosed}
+          preset={transferPreset ?? undefined}
           onSuccess={() => {
             void handleTransferSuccess();
           }}

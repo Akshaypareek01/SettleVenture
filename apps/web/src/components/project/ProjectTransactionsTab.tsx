@@ -258,6 +258,23 @@ function EntryCard({
               {beneficiaryName ?? transaction.paidTo ?? 'Partner'}
             </p>
           )}
+          {transaction.transferBucket === 'COMBINED' && transaction.transferAllocations && (
+            <p className="text-xs text-muted mt-1">
+              {[
+                transaction.transferAllocations.investment > 0.01
+                  ? `Investment ${formatINR(transaction.transferAllocations.investment)}`
+                  : null,
+                transaction.transferAllocations.expenses > 0.01
+                  ? `Expenses ${formatINR(transaction.transferAllocations.expenses)}`
+                  : null,
+                transaction.transferAllocations.emi > 0.01
+                  ? `EMI ${formatINR(transaction.transferAllocations.emi)}`
+                  : null,
+              ]
+                .filter(Boolean)
+                .join(' · ')}
+            </p>
+          )}
           {transaction.bankAccountLabel && (
             <p className="text-sm text-muted mt-2">Account: {transaction.bankAccountLabel}</p>
           )}
